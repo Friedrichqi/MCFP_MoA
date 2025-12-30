@@ -25,27 +25,33 @@ class ReqState(str, Enum):
     DONE = "done"
 
 
-@dataclass(frozen=True)
+@dataclass
 class ModelInfo:
-    """
-    Model card fields.
-    - size_bytes: bf16 weights size
+    '''
+    Mutable model card / online stats.
+
+    Fields:
+    - size_bytes: bf16 weights size (approx ok)
     - tp_min: minimum tensor parallel degree required
-    - t_wake_s: slept->active
-    - t_load_s: evicted->active
-    - avg_service_s: mean per-request service time (from vLLM stats or a model card default)
-    """
+    - t_wake_s: slept->active (online EMA)
+    - t_load_s: evicted->active load (online EMA)
+    - avg_service_s: mean per-request service time
+    '''
     name: str
     size_bytes: int
     tp_min: int
-    t_wake_s: float
-    t_load_s: float
+    t_wake_s: float = 2.0
+    t_load_s: float = 90.0
     avg_service_s: float = 0.2
 
-    @property
     def shard_bytes(self) -> float:
-        # Uses the user's constraint formula: Size/TP_min
         return float(self.size_bytes) / float(self.tp_min)
+
+    def update_wake(self, observed_s: float, ema: float = 0.2) -> None:
+        self.t_wake_s = max(1e-3, (1.0 - ema) * float(self.t_wake_s) + ema * float(observed_s))
+
+    def update_load(self, observed_s: float, ema: float = 0.2) -> None:
+        self.t_load_s = max(1e-3, (1.0 - ema) * float(self.t_load_s) + ema * float(observed_s))
 
 
 @dataclass
@@ -56,32 +62,30 @@ class GPUInfo:
 
     # model -> ACTIVE/SLEPT, absent means evicted
     resident: Dict[str, Residence] = field(default_factory=dict)
-
-    # model -> last used timestamp
     last_used: Dict[str, float] = field(default_factory=dict)
 
     @property
     def weight_cap(self) -> float:
         return self.alpha * float(self.vram_total_bytes)
 
-    def is_resident(self, m: str) -> bool:
-        return m in self.resident
+    def is_resident(self, model: str) -> bool:
+        return model in self.resident
 
-    def set_state(self, m: str, st: Residence, now: float) -> None:
-        self.resident[m] = st
-        self.last_used[m] = now
+    def set_state(self, model: str, st: Residence, now: float) -> None:
+        self.resident[model] = st
+        self.last_used[model] = now
 
-    def evict(self, m: str) -> None:
-        self.resident.pop(m, None)
-        self.last_used.pop(m, None)
+    def evict(self, model: str) -> None:
+        self.resident.pop(model, None)
+        self.last_used.pop(model, None)
 
 
 @dataclass
 class Instance:
-    """
-    One "slot" per GPU set, can be IDLE/ACTIVE/DRAINING/SWITCHING.
+    '''
+    One slot per GPU set, can be IDLE/ACTIVE/DRAINING/SWITCHING.
     backlog_q and avg_time_s are used for C_run and C_drain.
-    """
+    '''
     gpus: Tuple[int, ...]
     state: InstState = InstState.IDLE
     model: Optional[str] = None
@@ -92,10 +96,12 @@ class Instance:
 
 @dataclass
 class Request:
-    """
-    One schedulable unit = one DAG vertex (vertex == model name).
-    indegree drives readiness (0 => ready).
-    """
+    '''
+    One schedulable unit = one DAG node (stage). Multiple nodes may share the same model.
+
+    - node_id is the stage identifier (unique within job).
+    - model is the underlying model name (may repeat across stages).
+    '''
     job_id: str
     node_id: str
     model: str
@@ -119,8 +125,9 @@ class SwitchPlan:
     target_model: str
     overlapped_sets: Tuple[Tuple[int, ...], ...]
     displaced_models: Tuple[str, ...]
-    evict_ops: Tuple[Tuple[int, str], ...]     # (gpu, model) evictions to apply
-    evicted_models: Tuple[str, ...]            # unique models evicted
+    evict_ops: Tuple[Tuple[int, str], ...]     # (gpu, model)
+    evicted_models: Tuple[str, ...]
+    activate_kind: str                          # "wake" or "load"
     est_drain_s: float
     est_activate_s: float
     est_evict_s: float
@@ -128,9 +135,12 @@ class SwitchPlan:
 
 
 class VLLMController:
-    """
-    Extension point: replace SimVLLMController with a real adapter that talks to vLLM instances.
-    """
+    '''
+    Adapter interface for real vLLM.
+
+    - infer: run inference
+    - stop_accepting_new: ask instance to drain (optional)
+    '''
     async def infer(self, model: str, payload: Any, gpu_set: Tuple[int, ...]) -> Any:
         raise NotImplementedError
 
@@ -139,9 +149,9 @@ class VLLMController:
 
 
 class SimVLLMController(VLLMController):
-    """
+    '''
     End-to-end runnable simulator (no vLLM needed).
-    """
+    '''
     def __init__(self, models: Dict[str, ModelInfo]):
         self.models = models
 
@@ -151,11 +161,13 @@ class SimVLLMController(VLLMController):
 
 
 class moa_scheduler:
-    """
-    POTENTIAL/WAITING PQs and cost-based choice among:
-      - RUN: dispatch to an active instance serving req.model
-      - WAIT: keep waiting for this step
-      - SWITCH: drain overlapped sets, activate req.model on some GPU set
+    '''
+    Scheduler with POTENTIAL/WAITING priority queues (by t_arr).
+
+    Decisions per waiting request:
+      - RUN: dispatch to active instance
+      - WAIT: keep waiting
+      - SWITCH: drain + activate + eviction penalty
 
     Latest costs:
 
@@ -174,8 +186,8 @@ class moa_scheduler:
               Evict models with smallest Need(.)
               C_evict = base_sleep + sum_{e evicted} Need(e)*(Tload(e)-Twake(e))
 
-    Need(x) counts models over W ∪ P at decision time.
-    """
+    Need(x) counts models over POTENTIAL ∪ WAITING.
+    '''
 
     def __init__(
         self,
@@ -187,13 +199,15 @@ class moa_scheduler:
         beta: float = 1.0,
         controller: Optional[VLLMController] = None,
         max_decisions_per_step: int = 128,
+        timing_ema: float = 0.2,
     ) -> None:
-        self.alpha, self.beta = alpha, beta
+        self.alpha, self.beta = float(alpha), float(beta)
         self.models = models
+        self.timing_ema = float(timing_ema)
 
         self.gpus: Dict[int, GPUInfo] = {g.gpu_id: g for g in gpus}
         self.gpu_sets: List[Tuple[int, ...]] = [tuple(s) for s in gpu_sets]
-        self.instances: Dict[Tuple[int, ...], Instance] = {tuple(s): Instance(tuple(s)) for s in self.gpu_sets}
+        self.instances: Dict[Tuple[int, ...], Instance] = {s: Instance(s) for s in self.gpu_sets}
 
         self._reqs: Dict[str, Request] = {}
         self._potential: List[Tuple[float, int, str]] = []
@@ -203,7 +217,7 @@ class moa_scheduler:
         self.controller = controller or SimVLLMController(models)
         self._lock = asyncio.Lock()
         self._bg: Set[asyncio.Task] = set()
-        self.max_decisions_per_step = max_decisions_per_step
+        self.max_decisions_per_step = int(max_decisions_per_step)
 
     # -----------------
     # Queue operations
@@ -232,7 +246,7 @@ class moa_scheduler:
         k = f"{job_id}:{node_id}"
         async with self._lock:
             if k in self._reqs:
-                self._reqs[k].indegree = new_indegree
+                self._reqs[k].indegree = int(new_indegree)
 
     async def move_ready_potential_to_waiting(self) -> int:
         """
@@ -249,6 +263,7 @@ class moa_scheduler:
                     continue
                 if r.indegree == 0:
                     r.state = ReqState.WAITING
+                    r.t_arr = time.monotonic()
                     self._push(self._waiting, r.t_arr, k)
                     moved += 1
                 else:
@@ -294,36 +309,30 @@ class moa_scheduler:
                 if action == "RUN" and run_set and math.isfinite(run_cost):
                     # r leaves W -> update Need
                     need[r.model] = max(0, need.get(r.model, 0) - 1)
-
                     self._dispatch_locked(r, run_set, now)
 
                     # Discover successors immediately and update Need immediately.
                     if r.on_dispatched:
-                        try:
-                            succ_reqs = r.on_dispatched(r) or []
-                        except Exception:
-                            succ_reqs = []
-                        for sr in succ_reqs:
-                            if self._add_to_potential_locked(sr):
-                                need[sr.model] = need.get(sr.model, 0) + 1
+                        self._discover_successors_locked(r, need)
 
                 elif action == "SWITCH" and plan and math.isfinite(sw_cost):
                     reserved |= set(plan.target_set)
                     need[r.model] = max(0, need.get(r.model, 0) - 1)
-
                     self._schedule_switch_locked(r, plan, now)
-
                     if r.on_dispatched:
-                        try:
-                            succ_reqs = r.on_dispatched(r) or []
-                        except Exception:
-                            succ_reqs = []
-                        for sr in succ_reqs:
-                            if self._add_to_potential_locked(sr):
-                                need[sr.model] = need.get(sr.model, 0) + 1
+                        self._discover_successors_locked(r, need)
 
                 else:
                     self._requeue_locked(r)
+
+    def _discover_successors_locked(self, r: Request, need: Dict[str, int]) -> None:
+        try:
+            succ_reqs = r.on_dispatched(r) or []
+        except Exception:
+            succ_reqs = []
+        for sr in succ_reqs:
+            if self._add_to_potential_locked(sr):
+                need[sr.model] = need.get(sr.model, 0) + 1
 
     # -----------------
     # Cost helpers
@@ -375,9 +384,11 @@ class moa_scheduler:
             inst2 = self.instances[s2]
             drain = max(drain, float(inst2.backlog_q) * float(inst2.avg_time_s))
 
-        # C_activate
+        # C_activate (wake vs load)
+        is_resident = all(self.gpus[g].is_resident(target_model) for g in target_set)
         info_t = self.models[target_model]
-        activate = info_t.t_wake_s if all(self.gpus[g].is_resident(target_model) for g in target_set) else info_t.t_load_s
+        activate_kind = "wake" if is_resident else "load"
+        activate = info_t.t_wake_s if is_resident else info_t.t_load_s
 
         # C_evict
         evict_cost, evict_ops, evicted = self._evict_cost_locked(target_set, target_model, displaced, need)
@@ -392,6 +403,7 @@ class moa_scheduler:
             displaced_models=tuple(sorted(displaced)),
             evict_ops=tuple(evict_ops),
             evicted_models=tuple(sorted(evicted)),
+            activate_kind=activate_kind,
             est_drain_s=drain,
             est_activate_s=float(activate),
             est_evict_s=evict_cost,
@@ -405,26 +417,31 @@ class moa_scheduler:
         displaced: Set[str],
         need: Dict[str, int],
     ) -> Tuple[float, List[Tuple[int, str]], Set[str]]:
-        # Base: sleeping displaced active models
+        # Base cost: sleep displaced active models
         base = 0.0
         for u in displaced:
-            if u in self.models:
-                base += float(need.get(u, 0)) * float(self.models[u].t_wake_s)
+            mi = self.models.get(u)
+            if mi:
+                base += float(need.get(u, 0)) * float(mi.t_wake_s)
 
-        # Scenario 1: check if C1 holds without eviction
+        # Scenario 1: if C1 met after placing target shard => no eviction
         for g in target_set:
-            used = self._weight_used_locked(g) + (0.0 if self.gpus[g].is_resident(target_model) else self.models[target_model].shard_bytes)
+            used = self._weight_used_locked(g)
+            if not self.gpus[g].is_resident(target_model):
+                used += self.models[target_model].shard_bytes()
             if used > self.gpus[g].weight_cap + 1e-6:
                 break
         else:
             return base, [], set()
 
-        # Scenario 2: must evict. Policy: smallest Need(.)
+        # Scenario 2: must evict models with smallest Need(.), tie by LRU (oldest first).
         ops: List[Tuple[int, str]] = []
         evicted: Set[str] = set()
 
         for g in target_set:
-            used = self._weight_used_locked(g) + (0.0 if self.gpus[g].is_resident(target_model) else self.models[target_model].shard_bytes)
+            used = self._weight_used_locked(g)
+            if not self.gpus[g].is_resident(target_model):
+                used += self.models[target_model].shard_bytes()
             excess = used - self.gpus[g].weight_cap
             if excess <= 1e-6:
                 continue
@@ -433,26 +450,22 @@ class moa_scheduler:
             if not candidates:
                 return math.inf, [], set()
 
-            def key(m: str) -> Tuple[int, float, float]:
-                # primary: smallest Need
+            def key(m: str) -> Tuple[int, float]:
                 n = int(need.get(m, 0))
-                # tie: smaller delta (Tload-Twake)
-                delta = float(self.models[m].t_load_s - self.models[m].t_wake_s) if m in self.models else 0.0
-                # tie: older LRU
-                last = float(self.gpus[g].last_used.get(m, 0.0))
-                return (n, delta, last)
+                last = float(self.gpus[g].last_used.get(m, 0.0))  # older = smaller
+                return (n, last)
 
             candidates.sort(key=key)
 
             for m in candidates:
                 if excess <= 1e-6:
                     break
-                shard = self.models[m].shard_bytes if m in self.models else 0.0
-                if shard <= 0:
+                mi = self.models.get(m)
+                if not mi:
                     continue
                 ops.append((g, m))
                 evicted.add(m)
-                excess -= shard
+                excess -= mi.shard_bytes()
 
             if excess > 1e-6:
                 return math.inf, [], set()
@@ -460,8 +473,9 @@ class moa_scheduler:
         # Extra penalty for eviction vs sleep
         delta_cost = 0.0
         for e in evicted:
-            if e in self.models:
-                delta_cost += float(need.get(e, 0)) * float(self.models[e].t_load_s - self.models[e].t_wake_s)
+            mi = self.models.get(e)
+            if mi:
+                delta_cost += float(need.get(e, 0)) * float(mi.t_load_s - mi.t_wake_s)
 
         return base + delta_cost, ops, evicted
 
@@ -498,7 +512,7 @@ class moa_scheduler:
         inst_t.accept_new = False
 
         r.state = ReqState.RUNNING
-        self._spawn(self._switch_then_run(r, plan, now))
+        self._spawn(self._switch_then_run(r, plan))
 
     # -----------------
     # Background tasks
@@ -522,7 +536,7 @@ class moa_scheduler:
             except Exception:
                 pass
 
-    async def _switch_then_run(self, r: Request, plan: SwitchPlan, now0: float) -> None:
+    async def _switch_then_run(self, r: Request, plan: SwitchPlan) -> None:
         # best-effort stop accepting new
         for s2 in plan.overlapped_sets:
             try:
@@ -530,9 +544,10 @@ class moa_scheduler:
             except Exception:
                 pass
 
-        # wait drain estimate
+        # Drain (estimated)
         await asyncio.sleep(max(0.0, plan.est_drain_s))
 
+        # Deactivate overlapped; apply evictions; stage target weights
         async with self._lock:
             now = time.monotonic()
 
@@ -550,12 +565,13 @@ class moa_scheduler:
             for g, m in plan.evict_ops:
                 self.gpus[g].evict(m)
 
-            # ensure target weights are resident (but not serving yet)
+            # Determine wake vs load at execution-time
+            is_resident_now = all(self.gpus[g].is_resident(plan.target_model) for g in plan.target_set)
+            kind_now = "wake" if is_resident_now else "load"
+
+            # Stage weights (resident as SLEPT)
             for g in plan.target_set:
-                if not self.gpus[g].is_resident(plan.target_model):
-                    self.gpus[g].set_state(plan.target_model, Residence.SLEPT, now)
-                else:
-                    self.gpus[g].set_state(plan.target_model, Residence.SLEPT, now)
+                self.gpus[g].set_state(plan.target_model, Residence.SLEPT, now)
 
             # keep target instance in SWITCHING until activation completes
             inst_t = self.instances[plan.target_set]
@@ -564,14 +580,26 @@ class moa_scheduler:
             inst_t.backlog_q = 1          # reserve one slot for r
             inst_t.state, inst_t.accept_new = InstState.SWITCHING, False
 
-        # simulate wake/load time
-        await asyncio.sleep(max(0.0, plan.est_activate_s))
+        # Activation timing (EMA update)
+        t0 = time.monotonic()
+        if kind_now == "wake":
+            await asyncio.sleep(max(0.0, self.models[plan.target_model].t_wake_s))
+        else:
+            await asyncio.sleep(max(0.0, self.models[plan.target_model].t_load_s))
+        obs = time.monotonic() - t0
 
-        # now mark the instance active and weights active
         async with self._lock:
+            mi = self.models.get(plan.target_model)
+            if mi:
+                if kind_now == "wake":
+                    mi.update_wake(obs, ema=self.timing_ema)
+                else:
+                    mi.update_load(obs, ema=self.timing_ema)
+
             now = time.monotonic()
             for g in plan.target_set:
                 self.gpus[g].set_state(plan.target_model, Residence.ACTIVE, now)
+
             inst_t = self.instances[plan.target_set]
             inst_t.state, inst_t.accept_new = InstState.ACTIVE, True
 
@@ -583,7 +611,12 @@ class moa_scheduler:
 
     def _weight_used_locked(self, gpu_id: int) -> float:
         g = self.gpus[gpu_id]
-        return sum(self.models[m].shard_bytes for m in g.resident.keys() if m in self.models)
+        used = 0.0
+        for m in g.resident.keys():
+            mi = self.models.get(m)
+            if mi:
+                used += mi.shard_bytes()
+        return used
 
     def _push(self, heap: List[Tuple[float, int, str]], t: float, k: str) -> None:
         self._seq += 1

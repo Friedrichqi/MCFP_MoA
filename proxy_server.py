@@ -1,38 +1,34 @@
 from __future__ import annotations
 
-import asyncio, json, os, subprocess, time, uuid
+import asyncio, json, os, subprocess, time, uuid, math
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from fastapi import FastAPI, HTTPException
 from contextlib import asynccontextmanager
 from pydantic import BaseModel, Field
-
+from huggingface_hub import HfApi, hf_hub_download
+import sys, pathlib as _pathlib
+sys.path.append(str(_pathlib.Path(__file__).resolve().parent))
 from MoA_Scheduler import GPUInfo, ModelInfo, Request, moa_scheduler, SimVLLMController
 
+
 def discover_gpus(alpha: float) -> List[GPUInfo]:
-    try:
-        out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=index,memory.total", "--format=csv,noheader,nounits"],
-            text=True,
-        ).strip()
-        gpus: List[GPUInfo] = []
-        for line in out.splitlines():
-            idx_s, mem_mib_s = [x.strip() for x in line.split(",")]
-            gpus.append(GPUInfo(int(idx_s), int(mem_mib_s) * 1024 * 1024, alpha))
-        if not gpus:
-            raise RuntimeError("no GPUs from nvidia-smi")
-        return sorted(gpus, key=lambda g: g.gpu_id)
-    except Exception:
-        # dev fallback (CPU machine)
-        fake_gb = float(os.getenv("FAKE_GPU_VRAM_GB", "24"))
-        return [GPUInfo(0, int(fake_gb * (1024**3)), alpha)]
+    out = subprocess.check_output(
+        ["nvidia-smi", "--query-gpu=index,memory.total", "--format=csv,noheader,nounits"],
+        text=True,
+    ).strip()
+    gpus: List[GPUInfo] = []
+    for line in out.splitlines():
+        idx_s, mem_mib_s = [x.strip() for x in line.split(",")]
+        gpus.append(GPUInfo(int(idx_s), int(mem_mib_s) * 1024 * 1024, alpha))
+    if not gpus:
+        raise RuntimeError("no GPUs from nvidia-smi")
+    return sorted(gpus, key=lambda g: g.gpu_id)
 
 
 def build_hierarchical_sets(gpu_ids: List[int]) -> List[Tuple[int, ...]]:
-    """
-    Hierarchical sets: TP 1/2/4/8/...
-    """
+    '''Hierarchical sets: TP 1/2/4/8/... aligned by index.'''
     sets: Set[Tuple[int, ...]] = set((gid,) for gid in gpu_ids)
     n, size = len(gpu_ids), 2
     while size <= n:
@@ -44,18 +40,36 @@ def build_hierarchical_sets(gpu_ids: List[int]) -> List[Tuple[int, ...]]:
     return sorted(sets, key=lambda s: (len(s), s))
 
 
-def load_model_card(path: str) -> Dict[str, ModelInfo]:
-    """
-    model_card.json format:
-    {
-      "models": {
-        "M1": {"size_gb": 14, "tp_min": 1, "t_wake_s": 0.7, "t_load_s": 3.5, "avg_service_s": 0.25},
-        ...
-      }
-    }
-    """
+def _nearest_pow2_ge(x: int) -> int:
+    p = 1
+    while p < x:
+        p <<= 1
+    return p
+
+
+def read_model_card(path: str) -> Dict[str, Dict[str, Any]]:
+    if not os.path.exists(path):
+        return {}
     with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+        return json.load(f) or {}
+
+
+def write_model_card(path: str, data: Dict[str, Dict[str, Any]]) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
+def load_model_card(path: str) -> Dict[str, ModelInfo]:
+    '''
+    model_card.json format (flat dict):
+    {
+      "repo_id": {"size_gb": 14, "tp_min": 1, "t_wake_s": 2, "t_load_s": 90, "avg_service_s": 0.25},
+      ...
+    }
+    '''
+    data = read_model_card(path)
     models: Dict[str, ModelInfo] = {}
     for name, cfg in data.items():
         size_gb = float(cfg["size_gb"])
@@ -63,32 +77,119 @@ def load_model_card(path: str) -> Dict[str, ModelInfo]:
             name=name,
             size_bytes=int(size_gb * (1024**3)),
             tp_min=int(cfg["tp_min"]),
-            t_wake_s=float(cfg.get("t_wake_s", 1.0)),
-            t_load_s=float(cfg.get("t_load_s", 5.0)),
+            t_wake_s=float(cfg.get("t_wake_s", 2.0)),
+            t_load_s=float(cfg.get("t_load_s", 90.0)),
             avg_service_s=float(cfg.get("avg_service_s", 0.2)),
         )
-    if not models:
-        raise ValueError("model_card.json missing or empty 'models'")
     return models
 
 
+def hf_guess_model_size_gb(repo_id: str) -> float:
+    '''
+    Best-effort model size estimate from HF repo metadata.
+    Prefers safetensors/bin weights sizes; falls back to index.json metadata.
+    '''
+    api = HfApi()
+
+    # 1) sum sibling sizes
+    try:
+        info = api.repo_info(repo_id=repo_id, repo_type="model")
+        total = 0
+        for s in info.siblings:
+            if s.size is None:
+                continue
+            fn = s.rfilename.lower()
+            if fn.endswith(".safetensors") or fn.endswith(".bin"):
+                total += int(s.size)
+        if total > 0:
+            return float(total) / float(1024**3)
+    except Exception:
+        pass
+
+    # 2) index file metadata
+    for idx_name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
+        try:
+            p = hf_hub_download(repo_id=repo_id, filename=idx_name)
+            with open(p, "r", encoding="utf-8") as f:
+                j = json.load(f)
+            total_size = j.get("metadata", {}).get("total_size", 0)
+            if total_size:
+                return float(total_size) / float(1024**3)
+        except Exception:
+            continue
+
+    raise RuntimeError(f"Couldn't determine model size for {repo_id} from Hugging Face")
+
+
+def choose_tp_min_homogeneous(size_bytes: int, gpus: List[GPUInfo]) -> int:
+    '''
+    Homogeneous single-node assumption:
+      shard_bytes = size_bytes / tp
+      require shard_bytes <= alpha * min_vram
+      tp_min = ceil(size_bytes / (alpha*min_vram)), rounded up to power-of-two for hierarchical sets.
+    '''
+    min_vram = min(g.vram_total_bytes for g in gpus)
+    if min_vram <= 0:
+        return 1
+    raw = int(math.ceil(float(size_bytes) / min_vram))
+    raw = max(1, raw)
+    tp = _nearest_pow2_ge(raw)
+    if tp > len(gpus):
+        tp = len(gpus)
+    return max(1, tp)
+
+
+async def ensure_model(sched: moa_scheduler, model_id: str, gpus: List[GPUInfo], model_card_path: str) -> None:
+    '''
+    If model isn't in sched.models, pull size_gb from HuggingFace, choose tp_min, set defaults:
+      t_wake_s=2, t_load_s=90.
+    Also persist to model_card.json for next runs.
+    '''
+    if model_id in sched.models:
+        return
+
+    size_gb = hf_guess_model_size_gb(model_id)
+    size_bytes = int(size_gb * (1024**3))
+    tp_min = choose_tp_min_homogeneous(size_bytes, gpus)
+
+    sched.models[model_id] = ModelInfo(
+        name=model_id,
+        size_bytes=size_bytes,
+        tp_min=tp_min,
+        t_wake_s=2.0,
+        t_load_s=90.0,
+        avg_service_s=0.2,
+    )
+
+    data = read_model_card(model_card_path)
+    data[model_id] = {
+        "size_gb": size_gb,
+        "tp_min": tp_min,
+        "t_wake_s": 2.0,
+        "t_load_s": 90.0,
+        "avg_service_s": 0.2,
+    }
+    write_model_card(model_card_path, data)
+
+
 # -----------------------
-# Job graph
+# Job graph (supports repeated models via node_models mapping)
 # -----------------------
 
 @dataclass
 class JobGraph:
     job_id: str
-    graph: Dict[str, List[str]]
-    inputs: Dict[str, Any] = field(default_factory=dict)
+    graph: Dict[str, List[str]] = field(default_factory=dict)           # node_id -> [node_id]
+    node_models: Dict[str, str] = field(default_factory=dict)           # node_id -> model_id
+    inputs: Dict[str, Any] = field(default_factory=dict)                # node_id -> base input
 
     nodes: Set[str] = field(default_factory=set)
     indegree: Dict[str, int] = field(default_factory=dict)
     parents: Dict[str, List[str]] = field(default_factory=dict)
 
-    discovered: Set[str] = field(default_factory=set)
-    completed: Set[str] = field(default_factory=set)
-    outputs: Dict[str, Any] = field(default_factory=dict)
+    discovered: Set[str] = field(default_factory=set)                   # node_ids inserted into scheduler
+    completed: Set[str] = field(default_factory=set)                    # node_ids completed
+    outputs: Dict[str, Any] = field(default_factory=dict)               # node_id -> output
 
     def __post_init__(self) -> None:
         all_nodes: Set[str] = set(self.graph.keys())
@@ -98,6 +199,13 @@ class JobGraph:
         for n in list(all_nodes):
             self.graph.setdefault(n, [])
         self.nodes = all_nodes
+
+        if not self.node_models:
+            self.node_models = {n: n for n in self.nodes}
+        else:
+            for n in self.nodes:
+                if n not in self.node_models:
+                    raise ValueError(f"node_models missing mapping for node '{n}'")
 
         self.indegree = {n: 0 for n in self.nodes}
         self.parents = {n: [] for n in self.nodes}
@@ -125,16 +233,19 @@ class JobGraph:
     def done(self) -> bool:
         return len(self.completed) == len(self.nodes)
 
+    def model_of(self, node: str) -> str:
+        return self.node_models[node]
+
     def payload(self, node: str) -> Any:
         base = self.inputs.get(node, {})
         parent_out = {p: self.outputs[p] for p in self.parents[node]}
-        return {"node": node, "base": base, "parents": parent_out}
+        return {"node_id": node, "model": self.model_of(node), "base": base, "parents": parent_out}
 
     def make_req(self, node: str) -> Request:
         return Request(
             job_id=self.job_id,
             node_id=node,
-            model=node,  # vertex == model name
+            model=self.model_of(node),
             t_arr=time.monotonic(),
             indegree=self.indegree[node],
             succ=list(self.graph.get(node, [])),
@@ -146,7 +257,11 @@ class JobGraph:
 # -----------------------
 
 class SubmitBody(BaseModel):
-    graph: Dict[str, List[str]] = Field(...)
+    graph: Dict[str, List[str]] = Field(..., description="Adjacency list over node_ids (stages).")
+    node_models: Optional[Dict[str, str]] = Field(
+        default=None,
+        description="Optional map node_id -> model_id. If omitted, node_id is treated as model_id."
+    )
     inputs: Optional[Dict[str, Any]] = Field(default=None)
     job_id: Optional[str] = Field(default=None)
 
@@ -173,34 +288,36 @@ MODEL_CARD_PATH = os.getenv("MODEL_CARD_PATH", "model_card.json")
 
 scheduler: Optional[moa_scheduler] = None
 jobs: Dict[str, JobGraph] = {}
+gpu_snapshot: List[GPUInfo] = []
 
 
 @asynccontextmanager
-async def lifespan() -> None:
-    global scheduler
-    gpus = discover_gpus(ALPHA)
-    sets = build_hierarchical_sets([g.gpu_id for g in gpus])
-    models = load_model_card(MODEL_CARD_PATH)
+async def lifespan(app: FastAPI):
+    global scheduler, gpu_snapshot
+    gpu_snapshot = discover_gpus(ALPHA)
+    sets = build_hierarchical_sets([g.gpu_id for g in gpu_snapshot])
 
+    models = load_model_card(MODEL_CARD_PATH)
     scheduler = moa_scheduler(
-        gpus=gpus,
+        gpus=gpu_snapshot,
         gpu_sets=sets,
         models=models,
         alpha=ALPHA,
         beta=BETA,
-        controller=SimVLLMController(models),  # replace with real vLLM controller adapter
+        controller=SimVLLMController(models),
     )
 
     asyncio.create_task(_sched_loop())
+    yield
 
-app = FastAPI(title="MoA Proxy Server", version="0.1", lifespan=lifespan)
+
+app = FastAPI(title="MoA Proxy Server", version="0.2", lifespan=lifespan)
+
 
 async def _sched_loop() -> None:
     assert scheduler is not None
     while True:
-        # move indegree==0 from POTENTIAL -> WAITING
         await scheduler.move_ready_potential_to_waiting()
-        # choose policies & dispatch/switch
         await scheduler.step()
         await asyncio.sleep(INTERVAL_S)
 
@@ -215,13 +332,17 @@ async def submit_graph(body: SubmitBody) -> SubmitResp:
         raise HTTPException(status_code=409, detail="job_id already exists")
 
     try:
-        job = JobGraph(job_id=job_id, graph=body.graph, inputs=body.inputs or {})
+        job = JobGraph(job_id=job_id, graph=body.graph, node_models=body.node_models or {}, inputs=body.inputs or {})
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    unknown = [n for n in job.nodes if n not in scheduler.models]
-    if unknown:
-        raise HTTPException(status_code=400, detail=f"unknown model(s): {unknown}")
+    unique_models = sorted({job.model_of(n) for n in job.nodes})
+    for mid in unique_models:
+        if mid not in scheduler.models:
+            try:
+                await ensure_model(scheduler, mid, gpu_snapshot, MODEL_CARD_PATH)
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=str(e))
 
     jobs[job_id] = job
 
@@ -280,7 +401,6 @@ def _on_dispatched(job: JobGraph, req: Request) -> List[Request]:
         sreq.on_dispatched = lambda r, job=job: _on_dispatched(job, r)
         sreq.on_completed = lambda r, out, job=job: _on_completed(job, r, out)
         newly.append(sreq)
-
     return newly
 
 
