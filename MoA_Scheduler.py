@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import asyncio, heapq, math, time, subprocess, re
+import asyncio, heapq, math, time, subprocess, re, json, os, signal, subprocess, httpx
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
@@ -16,10 +16,11 @@ class Residence(str, Enum):
 
 
 class InstState(str, Enum):
-    IDLE = "idle"
     ACTIVE = "active"
+    SLEPT = "slept"
     DRAINING = "draining"
     SWITCHING = "switching"
+    DEAD = "dead"
 
 
 class ReqState(str, Enum):
@@ -33,42 +34,51 @@ class ReqState(str, Enum):
 class ModelInfo:
     """Mutable model-card entry + online stats.
 
-    Memory accounting:
-      - We do NOT keep bf16 weight size / shards.
-      - Instead we maintain an estimated per-GPU "slept weight" memory footprint,
-        which is updated when we actually sleep a model (via nvidia-smi pid used_memory).
+    EMAs:
+      - t_wake_s   : wake a slept instance
+      - t_sleep_s  : sleep an instance
+      - t_load_s   : start vLLM from scratch until ready
+      - t_offload_s: kill instance (offload/evict)
 
-    Defaults requested:
-      - slept_mem_MB_tp1 = 2048
+    Slept footprint is kept in MB per GPU, updated from nvidia-smi after sleep.
+
+    Defaults:
+      - slept_mem_MB_tp1   = 2048
       - slept_mem_MB_tpgt1 = 4096
-      - t_wake_s = 2, t_load_s = 90, t_offload_s = 3
+      - t_wake_s=t_sleep_s=2, t_load_s=90, t_offload_s=3
     """
+
     name: str
     tp_min: int
 
-    # Online timings (EMA)
     t_wake_s: float = 2.0
+    t_sleep_s: float = 2.0
     t_load_s: float = 90.0
     t_offload_s: float = 3.0
 
-    # Online "slept weights" footprint (MB per GPU)
     slept_mem_MB_tp1: float = 2048.0
     slept_mem_MB_tpgt1: float = 4096.0
 
-    # Simulator-only (optional)
     avg_service_s: float = 0.2
 
     def slept_mem_MB(self, tp: int) -> float:
         return float(self.slept_mem_MB_tp1 if int(tp) <= 1 else self.slept_mem_MB_tpgt1)
 
+    @staticmethod
+    def _ema(old: float, new: float, ema: float) -> float:
+        return max(1e-3, (1.0 - ema) * float(old) + ema * float(new))
+
     def update_wake(self, observed_s: float, ema: float = 0.2) -> None:
-        self.t_wake_s = max(1e-3, (1.0 - ema) * float(self.t_wake_s) + ema * float(observed_s))
+        self.t_wake_s = self._ema(self.t_wake_s, observed_s, ema)
+
+    def update_sleep(self, observed_s: float, ema: float = 0.2) -> None:
+        self.t_sleep_s = self._ema(self.t_sleep_s, observed_s, ema)
 
     def update_load(self, observed_s: float, ema: float = 0.2) -> None:
-        self.t_load_s = max(1e-3, (1.0 - ema) * float(self.t_load_s) + ema * float(observed_s))
+        self.t_load_s = self._ema(self.t_load_s, observed_s, ema)
 
     def update_offload(self, observed_s: float, ema: float = 0.2) -> None:
-        self.t_offload_s = max(1e-3, (1.0 - ema) * float(self.t_offload_s) + ema * float(observed_s))
+        self.t_offload_s = self._ema(self.t_offload_s, observed_s, ema)
 
     def update_slept_mem(self, tp: int, observed_MB_per_gpu: float, ema: float = 0.2) -> None:
         v = max(1.0, float(observed_MB_per_gpu))
@@ -84,32 +94,39 @@ class GPUInfo:
     vram_total_MB: int
     alpha: float
 
-    # model -> ACTIVE/SLEPT, absent means evicted
-    resident: Dict[str, Residence] = field(default_factory=dict)
-
-    # model -> pid on this GPU (vLLM can be multi-process; we track per-GPU PID)
-    pid_by_model: Dict[str, int] = field(default_factory=dict)
-
-    # model -> tp used when this model was loaded on this GPU (usually the instance TP)
-    tp_by_model: Dict[str, int] = field(default_factory=dict)
-
-    last_used: Dict[str, float] = field(default_factory=dict)
+    resident: Dict[str, Residence] = field(default_factory=dict)  # model -> ACTIVE/SLEPT
+    pid_by_model: Dict[str, int] = field(default_factory=dict)  # model -> pid on this GPU
+    url_by_model: Dict[str, str] = field(default_factory=dict)  # model -> base_url
+    tp_by_model: Dict[str, int] = field(default_factory=dict)  # model -> tp used on this GPU
+    last_used: Dict[str, float] = field(default_factory=dict)  # model -> monotonic timestamp
 
     @property
     def weight_cap_MB(self) -> float:
         return self.alpha * float(self.vram_total_MB)
 
-    def set_resident(self, model: str, st: Residence, now: float, *, pid: Optional[int] = None, tp: Optional[int] = None) -> None:
+    def set_resident(
+        self,
+        model: str,
+        st: Residence,
+        now: float,
+        *,
+        pid: Optional[int] = None,
+        tp: Optional[int] = None,
+        url: Optional[str] = None,
+    ) -> None:
         self.resident[model] = st
         self.last_used[model] = now
         if pid is not None:
             self.pid_by_model[model] = int(pid)
         if tp is not None:
             self.tp_by_model[model] = int(tp)
+        if url is not None:
+            self.url_by_model[model] = str(url)
 
-    def evict(self, model: str) -> None:
+    def evict_model(self, model: str) -> None:
         self.resident.pop(model, None)
         self.pid_by_model.pop(model, None)
+        self.url_by_model.pop(model, None)
         self.tp_by_model.pop(model, None)
         self.last_used.pop(model, None)
 
@@ -119,20 +136,17 @@ class GPUInfo:
 
 @dataclass
 class Instance:
-    """
-    One logical vLLM instance bound to a GPU set.
-    state can be IDLE/ACTIVE/DRAINING/SWITCHING.
-    """
+    """A single vLLM server process bound to a GPU set and a model."""
+
+    instance_id: str
     gpus: Tuple[int, ...]
-    state: InstState = InstState.IDLE
-    model: Optional[str] = None
+    model: str
+    base_url: str
+    metrics_url: str
+    state: InstState = InstState.ACTIVE
     accept_new: bool = True
-
-    # per-GPU PID mapping (required for memory accounting)
     pid_by_gpu: Dict[int, int] = field(default_factory=dict)
-
-    # where to fetch metrics; if empty, controller may use a default/global URL
-    metrics_url: str = ""
+    created_at: float = field(default_factory=lambda: time.monotonic())
 
 
 @dataclass
@@ -143,6 +157,7 @@ class Request:
     - node_id is the stage identifier (unique within job).
     - model is the underlying model name (may repeat across stages).
     '''
+
     job_id: str
     node_id: str
     model: str
@@ -153,8 +168,8 @@ class Request:
     state: ReqState = ReqState.POTENTIAL
 
     # on_dispatched returns "newly discovered successors" (Requests) to insert into POTENTIAL immediately.
-    on_dispatched = None
-    on_completed = None
+    on_dispatched: Optional[Callable[["Request"], List["Request"]]] = None
+    on_completed: Optional[Callable[["Request", Any], None]] = None
 
     def key(self) -> str:
         return f"{self.job_id}:{self.node_id}"
@@ -164,14 +179,15 @@ class Request:
 class SwitchPlan:
     target_set: Tuple[int, ...]
     target_model: str
-    overlapped_sets: Tuple[Tuple[int, ...], ...]
+    overlapped_active_ids: Tuple[str, ...]
     displaced_models: Tuple[str, ...]
-    evict_ops: Tuple[Tuple[int, str], ...]      # (gpu_id, model)
-    evicted_models: Tuple[str, ...]
-    activate_kind: str                          # "wake" or "load"
+    evict_models: Tuple[str, ...]
+    activate_kind: str  # "wake" or "load"
     est_drain_s: float
     est_activate_s: float
-    est_evict_s: float
+    est_sleep_now_s: float
+    est_offload_now_s: float
+    est_future_penalty_s: float
     total_cost_s: float
 
 
@@ -195,38 +211,116 @@ class MetricsSnapshot:
 # -----------------------------
 
 class VLLMController:
-    """Adapter for vLLM + nvidia-smi + metrics."""
-
-    async def infer(self, model: str, payload: Any, gpu_set: Tuple[int, ...]) -> Any:
-        raise NotImplementedError
-
-    async def stop_accepting_new(self, gpu_set: Tuple[int, ...]) -> None:
-        return None
-
-    async def metrics(self, instance: Instance) -> MetricsSnapshot:
+    async def metrics(self, inst: Instance) -> MetricsSnapshot:
         return MetricsSnapshot()
 
     async def pid_used_MB(self) -> Dict[Tuple[int, int], int]:
         return {}
 
-    async def sleep_observe(self, instance: Instance) -> Optional[float]:
-        return None
+    async def infer(self, inst: Instance, payload: Any) -> Any:
+        raise NotImplementedError
 
-    async def offload_observe(self, gpu_id: int, pid: int) -> Optional[float]:
-        return None
+    async def start(self, model: str, gpu_set: Tuple[int, ...], tp: int, gpu_mem_util: float) -> Instance:
+        raise NotImplementedError
+
+    async def sleep(self, inst: Instance) -> float:
+        raise NotImplementedError
+
+    async def wake(self, inst: Instance) -> float:
+        raise NotImplementedError
+
+    async def kill(self, inst: Instance) -> float:
+        raise NotImplementedError
+
+    async def drain_until_empty(self, inst: Instance, *, poll_s: float = 0.2, timeout_s: float = 600.0) -> float:
+        """Wait until num_requests==0. Returns elapsed."""
+        t0 = time.monotonic()
+        while True:
+            snap = await self.metrics(inst)
+            if snap.num_requests <= 0:
+                return time.monotonic() - t0
+            if time.monotonic() - t0 > timeout_s:
+                return time.monotonic() - t0
+            await asyncio.sleep(poll_s)
 
 
-class RealVLLMController(VLLMController):
-    """Real integrations via subprocess (curl + nvidia-smi)."""
+# -----------------------------
+# Managed vLLM controller (real servers)
+# -----------------------------
 
-    def __init__(self, default_metrics_url: str = "") -> None:
-        self.default_metrics_url = default_metrics_url
+class ManagedVLLMController(VLLMController):
+    """Spawns and controls vLLM servers via subprocess + HTTP.
 
-    async def metrics(self, instance: Instance) -> MetricsSnapshot:
-        url = instance.metrics_url or self.default_metrics_url
-        if not url:
-            return MetricsSnapshot()
-        return await asyncio.to_thread(self._metrics_sync, url, instance.model, instance.pid_by_gpu)
+    Launch:
+      CUDA_VISIBLE_DEVICES=<gpu-set> VLLM_SERVER_DEV_MODE=1 \
+        vllm serve <model> --tensor-parallel-size <tp> --port <port> \
+          --enable-sleep-mode --gpu-memory-utilization <util>
+
+    Sleep:
+      POST {base_url}/sleep?level=2
+    Wake:
+      POST {base_url}/wake_up
+
+    Offload/Evict:
+      kill -9 all known per-GPU pids; then wait until gone from nvidia-smi.
+
+    Metrics parsing:
+      vllm:num_requests
+      vllm:e2e_request_latency_seconds_(sum|count)
+    """
+
+    def __init__(
+        self,
+        *,
+        host: str = "127.0.0.1",
+        port_base: int = 9000,
+        request_timeout_s: float = 300.0,
+        startup_timeout_s: float = 600.0,
+        vllm_extra_args: Optional[List[str]] = None,
+    ) -> None:
+        self.host = host
+        self.port_base = int(port_base)
+        self.request_timeout_s = float(request_timeout_s)
+        self.startup_timeout_s = float(startup_timeout_s)
+        self.vllm_extra_args = list(vllm_extra_args or [])
+
+        self._next_port = self.port_base
+        self._procs: Dict[str, subprocess.Popen] = {}
+
+    # ---------- HTTP helpers ----------
+
+    async def _http_get_text(self, url: str) -> str:
+        async with httpx.AsyncClient(timeout=self.request_timeout_s) as client:
+            r = await client.get(url)
+            r.raise_for_status()
+            return r.text
+        return await asyncio.to_thread(lambda: subprocess.check_output(["curl", "-s", url], text=True))
+
+    async def _http_post_json(self, url: str, json_body: Dict[str, Any]) -> Any:
+        async with httpx.AsyncClient(timeout=self.request_timeout_s) as client:
+            r = await client.post(url, json=json_body)
+            r.raise_for_status()
+            return r.json()
+        payload = json.dumps(json_body)
+        out = await asyncio.to_thread(
+            lambda: subprocess.check_output(
+                ["curl", "-s", "-X", "POST", url, "-H", "Content-Type: application/json", "-d", payload],
+                text=True,
+            )
+        )
+        try:
+            return json.loads(out)
+        except Exception:
+            return {"raw": out}
+
+    async def _http_post_no_body(self, url: str) -> str:
+        async with httpx.AsyncClient(timeout=self.request_timeout_s) as client:
+            r = await client.post(url)
+            r.raise_for_status()
+            return r.text
+        return await asyncio.to_thread(lambda: subprocess.check_output(["curl", "-s", "-X", "POST", url], text=True))
+
+    # ---------- metrics parsing ----------
 
     @staticmethod
     def _parse_prom_line(line: str) -> Optional[Tuple[str, Dict[str, str], float]]:
@@ -252,10 +346,10 @@ class RealVLLMController(VLLMController):
             return None
         return m.group(1), {}, float(m.group(2))
 
-    @classmethod
-    def _metrics_sync(cls, url: str, model: Optional[str], pid_by_gpu: Dict[int, int]) -> MetricsSnapshot:
+    async def metrics(self, inst: Instance) -> MetricsSnapshot:
+        url = inst.metrics_url
         try:
-            raw = subprocess.check_output(["curl", "-s", url], text=True)
+            raw = await self._http_get_text(url)
         except Exception:
             return MetricsSnapshot()
 
@@ -267,7 +361,7 @@ class RealVLLMController(VLLMController):
 
         samples: Dict[str, List[Tuple[Dict[str, str], float]]] = {k: [] for k in targets}
         for ln in raw.splitlines():
-            parsed = cls._parse_prom_line(ln)
+            parsed = self._parse_prom_line(ln)
             if not parsed:
                 continue
             name, labels, val = parsed
@@ -278,20 +372,22 @@ class RealVLLMController(VLLMController):
             arr = samples.get(name, [])
             if not arr:
                 return 0.0
-            if model:
-                for labels, v in arr:
-                    if labels.get("model_name") == model:
-                        return float(v)
-            pids = {str(pid) for pid in pid_by_gpu.values() if pid}
+            for labels, v in arr:
+                if labels.get("model_name") == inst.model:
+                    return float(v)
+            pids = {str(pid) for pid in inst.pid_by_gpu.values() if pid}
             for labels, v in arr:
                 if labels.get("pid") in pids:
                     return float(v)
             return float(arr[0][1])
 
-        num = pick("vllm:num_requests")
-        s = pick("vllm:e2e_request_latency_seconds_sum")
-        c = pick("vllm:e2e_request_latency_seconds_count")
-        return MetricsSnapshot(num_requests=num, e2e_sum=s, e2e_count=c)
+        return MetricsSnapshot(
+            num_requests=pick("vllm:num_requests"),
+            e2e_sum=pick("vllm:e2e_request_latency_seconds_sum"),
+            e2e_count=pick("vllm:e2e_request_latency_seconds_count"),
+        )
+
+    # ---------- nvidia-smi pid memory ----------
 
     async def pid_used_MB(self) -> Dict[Tuple[int, int], int]:
         return await asyncio.to_thread(self._pid_used_MB_sync)
@@ -312,7 +408,11 @@ class RealVLLMController(VLLMController):
 
         try:
             out = subprocess.check_output(
-                ["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,used_memory", "--format=csv,noheader,nounits"],
+                [
+                    "nvidia-smi",
+                    "--query-compute-apps=gpu_uuid,pid,used_memory",
+                    "--format=csv,noheader,nounits",
+                ],
                 text=True,
             ).strip()
             res: Dict[Tuple[int, int], int] = {}
@@ -333,25 +433,221 @@ class RealVLLMController(VLLMController):
         except Exception:
             return {}
 
+    # ---------- lifecycle ----------
 
-class SimVLLMController(VLLMController):
-    """Runnable simulator. It doesn't call curl/nvidia-smi."""
-    def __init__(self, models: Dict[str, ModelInfo]) -> None:
-        self.models = models
-        self._inflight: Dict[Tuple[int, ...], int] = {}
+    def _alloc_port(self) -> int:
+        while True:
+            p = self._next_port
+            self._next_port += 1
+            if self._port_free(p):
+                return p
 
-    async def infer(self, model: str, payload: Any, gpu_set: Tuple[int, ...]) -> Any:
-        self._inflight[gpu_set] = self._inflight.get(gpu_set, 0) + 1
-        await asyncio.sleep(self.models[model].avg_service_s)
-        self._inflight[gpu_set] = max(0, self._inflight.get(gpu_set, 1) - 1)
-        return {"model": model, "gpu_set": list(gpu_set), "ok": True, "payload": payload}
+    @staticmethod
+    def _port_free(port: int) -> bool:
+        import socket
 
-    async def metrics(self, instance: Instance) -> MetricsSnapshot:
-        inflight = float(self._inflight.get(instance.gpus, 0))
-        mi = self.models.get(instance.model or "")
-        if not mi:
-            return MetricsSnapshot(num_requests=inflight, e2e_sum=0.0, e2e_count=0.0)
-        return MetricsSnapshot(num_requests=inflight, e2e_sum=float(mi.avg_service_s), e2e_count=1.0)
+        s = socket.socket()
+        try:
+            s.bind(("127.0.0.1", port))
+            return True
+        except Exception:
+            return False
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _gpu_used_total_MB(gpu_ids: Sequence[int]) -> Dict[int, Tuple[int, int]]:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=index,memory.used,memory.total", "--format=csv,noheader,nounits"],
+            text=True,
+        ).strip()
+        m: Dict[int, Tuple[int, int]] = {}
+        for ln in out.splitlines():
+            idx_s, used_s, total_s = [x.strip() for x in ln.split(",")]
+            idx = int(idx_s)
+            if idx in gpu_ids:
+                m[idx] = (int(float(used_s)), int(float(total_s)))
+        return m
+
+    @classmethod
+    def compute_gpu_mem_util(cls, gpu_set: Tuple[int, ...]) -> float:
+        try:
+            stats = cls._gpu_used_total_MB(list(gpu_set))
+            if not stats:
+                return 0.9
+            ratios = []
+            for _, (used, total) in stats.items():
+                free = max(0, total - used)
+                ratios.append(float(free) / float(total) if total > 0 else 0.0)
+            free_ratio = min(ratios) if ratios else 0.5
+            util = max(0.05, min(0.95, free_ratio * 0.9))
+            return float(util)
+        except Exception:
+            return 0.9
+
+    @staticmethod
+    def _snapshot_pids_by_gpu(gpu_set: Tuple[int, ...]) -> Dict[int, Set[int]]:
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi", "--query-compute-apps=gpu_uuid,pid", "--format=csv,noheader,nounits"],
+                text=True,
+            ).strip()
+        except Exception:
+            return {g: set() for g in gpu_set}
+
+        uuid_to_idx: Dict[str, int] = {}
+        try:
+            out2 = subprocess.check_output(["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader"], text=True).strip()
+            for ln in out2.splitlines():
+                idx, uuid = [x.strip() for x in ln.split(",")]
+                uuid_to_idx[uuid] = int(idx)
+        except Exception:
+            uuid_to_idx = {}
+
+        m: Dict[int, Set[int]] = {g: set() for g in gpu_set}
+        for ln in out.splitlines():
+            parts = [x.strip() for x in ln.split(",")]
+            if len(parts) != 2:
+                continue
+            gpu_uuid, pid_s = parts
+            if gpu_uuid not in uuid_to_idx:
+                continue
+            gid = uuid_to_idx[gpu_uuid]
+            if gid not in m:
+                continue
+            try:
+                m[gid].add(int(pid_s))
+            except Exception:
+                continue
+        return m
+
+    async def start(self, model: str, gpu_set: Tuple[int, ...], tp: int, gpu_mem_util: float) -> Instance:
+        port = self._alloc_port()
+        base_url = f"http://{self.host}:{port}"
+        metrics_url = f"{base_url}/metrics"
+        instance_id = f"{','.join(map(str, gpu_set))}|{model}|{port}"
+
+        before = await asyncio.to_thread(self._snapshot_pids_by_gpu, gpu_set)
+
+        env = dict(os.environ)
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(str(x) for x in gpu_set)
+        env["VLLM_SERVER_DEV_MODE"] = "1"
+
+        cmd = [
+            "vllm",
+            "serve",
+            model,
+            "--host",
+            self.host,
+            "--port",
+            str(port),
+            "--tensor-parallel-size",
+            str(tp),
+            "--enable-sleep-mode",
+            "--gpu-memory-utilization",
+            str(gpu_mem_util),
+        ] + self.vllm_extra_args
+
+        proc = subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        self._procs[instance_id] = proc
+
+        t0 = time.monotonic()
+        while True:
+            if proc.poll() is not None:
+                raise RuntimeError(f"vllm serve exited early for {instance_id} (rc={proc.returncode})")
+            try:
+                txt = await self._http_get_text(metrics_url)
+                if len(txt) > 0:
+                    break
+            except Exception:
+                pass
+            if time.monotonic() - t0 > self.startup_timeout_s:
+                raise TimeoutError(f"timeout waiting for vllm server {instance_id} ready")
+            await asyncio.sleep(0.5)
+
+        after = await asyncio.to_thread(self._snapshot_pids_by_gpu, gpu_set)
+        pid_by_gpu: Dict[int, int] = {}
+        for g in gpu_set:
+            new = list(after.get(g, set()) - before.get(g, set()))
+            pid_by_gpu[g] = int(new[0]) if new else int(proc.pid)
+
+        return Instance(
+            instance_id=instance_id,
+            gpus=tuple(gpu_set),
+            model=model,
+            base_url=base_url,
+            metrics_url=metrics_url,
+            state=InstState.ACTIVE,
+            accept_new=True,
+            pid_by_gpu=pid_by_gpu,
+        )
+
+    async def sleep(self, inst: Instance) -> float:
+        t0 = time.monotonic()
+        await self._http_post_no_body(f"{inst.base_url}/sleep?level=2")
+        return time.monotonic() - t0
+
+    async def wake(self, inst: Instance) -> float:
+        t0 = time.monotonic()
+        await self._http_post_no_body(f"{inst.base_url}/wake_up")
+        return time.monotonic() - t0
+
+    async def kill(self, inst: Instance) -> float:
+        t0 = time.monotonic()
+        pids = {int(p) for p in inst.pid_by_gpu.values() if p}
+        for pid in list(pids):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except Exception:
+                pass
+        proc = self._procs.get(inst.instance_id)
+        if proc and proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+        while True:
+            pid_map = await self.pid_used_MB()
+            alive = any((g, pid) in pid_map for g in inst.gpus for pid in pids)
+            if not alive:
+                break
+            if time.monotonic() - t0 > 120.0:
+                break
+            await asyncio.sleep(0.2)
+
+        return time.monotonic() - t0
+
+    async def infer(self, inst: Instance, payload: Any) -> Any:
+        # endpoint selection
+        if not isinstance(payload, dict):
+            payload = {"messages": [{"role": "user", "content": str(payload)}]}
+
+        endpoint = payload.pop("endpoint", None)
+        if endpoint is None:
+            if "messages" in payload:
+                endpoint = "/v1/chat/completions"
+            elif "prompt" in payload:
+                endpoint = "/v1/completions"
+            else:
+                endpoint = "/v1/chat/completions"
+                payload = {"messages": [{"role": "user", "content": json.dumps(payload)}]}
+
+        payload.setdefault("model", inst.model)
+        url = inst.base_url.rstrip("/") + endpoint
+        return await self._http_post_json(url, payload)
 
 
 # -----------------------------
@@ -359,36 +655,19 @@ class SimVLLMController(VLLMController):
 # -----------------------------
 
 class moa_scheduler:
-    '''
-    Scheduler with POTENTIAL/WAITING priority queues (by t_arr).
+    """MoA Scheduler with real vLLM management.
 
-    - Does NOT maintain backlog_q / avg_time_s; those come from vLLM /metrics snapshots.
-    - Does NOT maintain model size/shards; C1 uses per-GPU slept-weight footprint estimated from PID used_memory.
+    - Dispatch cost uses online /metrics snapshot: C_run = num_requests * avg_latency.
+    - Wait cost: C_wait = (now - t_arr) * beta.
+    - Switch cost (your latest): C_switch = C_drain + C_activate + C_evict, implemented as:
+        - C_drain: max backlog_cost among overlapped active instances.
+        - C_activate: Twake if slept instance exists on that set; else Tload.
+        - C_evict:
+            * current-time: sum Tsleep(displaced but kept) + sum Toffload(evicted)
+            * future penalty: sum Need(x)*Twake(x) for displaced kept + add Need(x)*(Tload-Twake) for evicted
 
-    Decisions per waiting request:
-      - RUN: dispatch to active instance
-      - WAIT: keep waiting
-      - SWITCH: drain cost + activate cost + eviction penalty
-
-    Latest costs:
-
-      C_wait(r) = beta * (now - t_arr)
-
-      C_switch(s,j) = C_drain(s) + C_activate(s,j) + C_evict(s,j)
-
-        C_drain(s) = max_{overlap inst} (Q_inst * avg_time_inst)
-
-        C_activate(s,j) = Twake(j) if j resident on all GPUs in s else Tload(j)
-
-        C_evict(s,j) has two scenarios:
-          (1) If C1 met after placing target shard(s):
-              C_evict = sum_{u displaced} Need(u)*Twake(u)
-          (2) If C1 not met:
-              Evict models with smallest Need(.)
-              C_evict = base_sleep + offload cost + sum_{e evicted} Need(e)*(Tload(e)-Twake(e))
-
-    Need(x) counts models over POTENTIAL ∪ WAITING.
-    '''
+    C1 is checked per-GPU, based on nvidia-smi pid memory when available, else model-card slept footprint.
+    """
 
     def __init__(
         self,
@@ -407,14 +686,17 @@ class moa_scheduler:
 
         self.gpus: Dict[int, GPUInfo] = {g.gpu_id: g for g in gpus}
         self.gpu_sets: List[Tuple[int, ...]] = [tuple(s) for s in gpu_sets]
-        self.instances: Dict[Tuple[int, ...], Instance] = {s: Instance(s) for s in self.gpu_sets}
+
+        self.instances: Dict[str, Instance] = {}
+        self.active_ids: Set[str] = set()
+        self.slept_ids: Set[str] = set()
 
         self._reqs: Dict[str, Request] = {}
         self._potential: List[Tuple[float, int, str]] = []
         self._waiting: List[Tuple[float, int, str]] = []
         self._seq = 0
 
-        self.controller = controller or SimVLLMController(models)
+        self.controller = controller or ManagedVLLMController()
         self._lock = asyncio.Lock()
         self._bg: Set[asyncio.Task] = set()
         self.max_decisions_per_step = int(max_decisions_per_step)
@@ -422,42 +704,22 @@ class moa_scheduler:
         self._pid_mem: Dict[Tuple[int, int], int] = {}
 
     # -----------------
-    # Instance registry
+    # External instance registration (optional)
     # -----------------
 
-    async def register_active_instance(
-        self,
-        gpu_set: Tuple[int, ...],
-        model: str,
-        pid_by_gpu: Dict[int, int],
-        metrics_url: str = "",
-    ) -> None:
+    async def register_existing_instance(self, inst: Instance) -> None:
+        """Attach an already-running vLLM server."""
         now = time.monotonic()
         async with self._lock:
-            if gpu_set not in self.instances:
-                raise ValueError(f"unknown gpu_set {gpu_set}")
-            inst = self.instances[gpu_set]
+            self.instances[inst.instance_id] = inst
             inst.state = InstState.ACTIVE
-            inst.model = model
-            inst.accept_new = True
-            inst.pid_by_gpu = dict(pid_by_gpu)
-            inst.metrics_url = metrics_url
+            self.active_ids.add(inst.instance_id)
+            self.slept_ids.discard(inst.instance_id)
 
-            tp = len(gpu_set)
-            for g in gpu_set:
-                pid = pid_by_gpu.get(g)
-                self.gpus[g].set_resident(model, Residence.ACTIVE, now, pid=pid, tp=tp)
-
-    async def unregister_instance(self, gpu_set: Tuple[int, ...]) -> None:
-        async with self._lock:
-            inst = self.instances.get(gpu_set)
-            if not inst:
-                return
-            inst.state = InstState.IDLE
-            inst.model = None
-            inst.accept_new = True
-            inst.pid_by_gpu = {}
-            inst.metrics_url = ""
+            tp = len(inst.gpus)
+            for g in inst.gpus:
+                pid = inst.pid_by_gpu.get(g)
+                self.gpus[g].set_resident(inst.model, Residence.ACTIVE, now, pid=pid, tp=tp, url=inst.base_url)
 
     # -----------------
     # Queue operations
@@ -530,51 +792,51 @@ class moa_scheduler:
 
             # Need counts over W ∪ P at the start of this step
             need = self._need_counts_locked()
-            inst_list = [self.instances[s] for s in self.instances if self.instances[s].state in (InstState.ACTIVE, InstState.DRAINING, InstState.SWITCHING)]
+            active_insts = [self.instances[iid] for iid in self.active_ids if iid in self.instances]
 
-        # snapshot metrics + pid memory outside lock
-        metrics_map: Dict[Tuple[int, ...], MetricsSnapshot] = {}
-        if inst_list:
-            snaps = await asyncio.gather(*[self.controller.metrics(inst) for inst in inst_list], return_exceptions=True)
-            for inst, snap in zip(inst_list, snaps):
-                metrics_map[inst.gpus] = snap if not isinstance(snap, Exception) else MetricsSnapshot()
+        # snapshots outside lock
+        metrics_map: Dict[str, MetricsSnapshot] = {}
+        if active_insts:
+            snaps = await asyncio.gather(*[self.controller.metrics(inst) for inst in active_insts], return_exceptions=True)
+            for inst, snap in zip(active_insts, snaps):
+                metrics_map[inst.instance_id] = snap if not isinstance(snap, Exception) else MetricsSnapshot()
 
         pid_mem = await self.controller.pid_used_MB()
-
         async with self._lock:
             if pid_mem:
                 self._pid_mem = pid_mem
-            reserved: Set[int] = set()
+
+            reserved_gpus: Set[int] = set()
 
         for k in batch:
             async with self._lock:
                 r = self._reqs.get(k)
                 if not r or r.state != ReqState.WAITING:
                     continue
+
                 if r.model not in self.models:
                     self._requeue_locked(r)
                     continue
 
-                run_cost, run_set = self._cost_run_locked(r, reserved, metrics_map)
+                run_cost, run_iid = self._cost_run_locked(r, reserved_gpus, metrics_map)
                 wait_cost = self.beta * max(0.0, now - r.t_arr)
-                sw_cost, plan = self._best_switch_locked(r, need, reserved, metrics_map)
+                sw_cost, plan = self._best_switch_locked(r, need, reserved_gpus, metrics_map)
 
                 action = min([("RUN", run_cost), ("WAIT", wait_cost), ("SWITCH", sw_cost)], key=lambda x: x[1])[0]
 
-                if action == "RUN" and run_set and math.isfinite(run_cost):
-                    # r leaves W -> update Need
+                if action == "RUN" and run_iid and math.isfinite(run_cost):
                     need[r.model] = max(0, need.get(r.model, 0) - 1)
-                    self._dispatch_locked(r, run_set, now)
-
-                    # Discover successors immediately and update Need immediately.
+                    # IMPORTANT: prepare payload + discover successors BEFORE sending request.
                     if r.on_dispatched:
                         self._discover_successors_locked(r, need)
+                    self._dispatch_locked(r, run_iid, now)
                 elif action == "SWITCH" and plan and math.isfinite(sw_cost):
-                    reserved |= set(plan.target_set)
+                    reserved_gpus |= set(plan.target_set)
                     need[r.model] = max(0, need.get(r.model, 0) - 1)
-                    self._schedule_switch_locked(r, plan, now)
+                    # IMPORTANT: prepare payload + discover successors BEFORE sending request.
                     if r.on_dispatched:
                         self._discover_successors_locked(r, need)
+                    self._schedule_switch_locked(r, plan, now)
                 else:
                     self._requeue_locked(r)
 
@@ -602,30 +864,33 @@ class moa_scheduler:
         self,
         r: Request,
         reserved: Set[int],
-        metrics_map: Dict[Tuple[int, ...], MetricsSnapshot],
-    ) -> Tuple[float, Optional[Tuple[int, ...]]]:
-        best, best_s = math.inf, None
-        for s, inst in self.instances.items():
-            if inst.state != InstState.ACTIVE or not inst.accept_new or inst.model != r.model:
+        metrics_map: Dict[str, MetricsSnapshot],
+    ) -> Tuple[float, Optional[str]]:
+        best, best_id = math.inf, None
+        for iid in self.active_ids:
+            inst = self.instances.get(iid)
+            if not inst or inst.model != r.model or inst.state != InstState.ACTIVE or not inst.accept_new:
                 continue
-            if any(g in reserved for g in s):
+            if any(g in reserved for g in inst.gpus):
                 continue
-            c = metrics_map.get(s, MetricsSnapshot()).backlog_cost
+            c = metrics_map.get(iid, MetricsSnapshot()).backlog_cost
             if c < best:
-                best, best_s = c, s
-        return best, best_s
+                best, best_id = c, iid
+        return best, best_id
 
     def _best_switch_locked(
         self,
         r: Request,
         need: Dict[str, int],
         reserved: Set[int],
-        metrics_map: Dict[Tuple[int, ...], MetricsSnapshot],
+        metrics_map: Dict[str, MetricsSnapshot],
     ) -> Tuple[float, Optional[SwitchPlan]]:
         info = self.models[r.model]
         best, best_plan = math.inf, None
         for s in self.gpu_sets:
-            if len(s) < info.tp_min or any(g in reserved for g in s):
+            if len(s) < info.tp_min:
+                continue
+            if any(g in reserved for g in s):
                 continue
             c, p = self._simulate_switch_locked(s, r.model, need, metrics_map)
             if c < best:
@@ -637,128 +902,131 @@ class moa_scheduler:
         target_set: Tuple[int, ...],
         target_model: str,
         need: Dict[str, int],
-        metrics_map: Dict[Tuple[int, ...], MetricsSnapshot],
+        metrics_map: Dict[str, MetricsSnapshot],
     ) -> Tuple[float, Optional[SwitchPlan]]:
-        overlapped: List[Tuple[int, ...]] = []
-        displaced: Set[str] = set()
+        overlapped_ids: List[str] = []
+        displaced_models: List[str] = []
 
-        for s2, inst2 in self.instances.items():
-            if inst2.state in (InstState.ACTIVE, InstState.DRAINING, InstState.SWITCHING) and not self._disjoint(s2, target_set):
-                overlapped.append(s2)
-                if inst2.model:
-                    displaced.add(inst2.model)
+        for iid in self.active_ids:
+            inst = self.instances.get(iid)
+            if not inst or inst.state != InstState.ACTIVE:
+                continue
+            if not self._disjoint(inst.gpus, target_set):
+                overlapped_ids.append(iid)
+                displaced_models.append(inst.model)
 
         # C_drain = max(Q*tau)
         drain_cost = 0.0
-        for s2 in overlapped:
-            drain_cost = max(drain_cost, metrics_map.get(s2, MetricsSnapshot()).backlog_cost)
+        for iid in overlapped_ids:
+            drain_cost = max(drain_cost, metrics_map.get(iid, MetricsSnapshot()).backlog_cost)
 
         # C_activate (wake vs load)
-        is_resident = all(self.gpus[g].is_resident(target_model) for g in target_set)
+        slept_iid = self._find_slept_instance_locked(target_model, target_set)
+        activate_kind = "wake" if slept_iid else "load"
         info_t = self.models[target_model]
-        activate_kind = "wake" if is_resident else "load"
-        activate_cost = info_t.t_wake_s if is_resident else info_t.t_load_s
+        activate_cost = info_t.t_wake_s if slept_iid else info_t.t_load_s
 
-        # C_evict
-        evict_cost, evict_ops, evicted = self._evict_cost_locked(target_set, target_model, displaced, need)
-        if not math.isfinite(evict_cost):
+        future_penalty = 0.0
+        for m in displaced_models:
+            mi = self.models.get(m)
+            if mi:
+                future_penalty += float(need.get(m, 0)) * float(mi.t_wake_s)
+
+        ok, to_evict = self._choose_evictions_locked(target_set, target_model, need)
+        if not ok:
             return math.inf, None
+        evict_set = set(to_evict)
 
-        total = drain_cost + activate_cost + evict_cost
+        sleep_now_s = 0.0
+        offload_now_s = 0.0
+
+        for m in displaced_models:
+            if m in evict_set:
+                continue
+            mi = self.models.get(m)
+            if mi:
+                sleep_now_s += float(mi.t_sleep_s)
+
+        for m in evict_set:
+            mi = self.models.get(m)
+            if not mi:
+                continue
+            offload_now_s += float(mi.t_offload_s)
+            future_penalty += float(need.get(m, 0)) * float(mi.t_load_s - mi.t_wake_s)
+
+        total = drain_cost + activate_cost + sleep_now_s + offload_now_s + future_penalty
+
         return total, SwitchPlan(
             target_set=target_set,
             target_model=target_model,
-            overlapped_sets=tuple(overlapped),
-            displaced_models=tuple(sorted(displaced)),
-            evict_ops=tuple(evict_ops),
-            evicted_models=tuple(sorted(evicted)),
+            overlapped_active_ids=tuple(overlapped_ids),
+            displaced_models=tuple(displaced_models),
+            evict_models=tuple(sorted(evict_set)),
             activate_kind=activate_kind,
-            est_drain_s=drain_cost,
+            est_drain_s=float(drain_cost),
             est_activate_s=float(activate_cost),
-            est_evict_s=evict_cost,
-            total_cost_s=total,
+            est_sleep_now_s=float(sleep_now_s),
+            est_offload_now_s=float(offload_now_s),
+            est_future_penalty_s=float(future_penalty),
+            total_cost_s=float(total),
         )
 
-    def _evict_cost_locked(
+    def _find_slept_instance_locked(self, model: str, gpu_set: Tuple[int, ...]) -> Optional[str]:
+        for iid in self.slept_ids:
+            inst = self.instances.get(iid)
+            if inst and inst.model == model and tuple(inst.gpus) == tuple(gpu_set) and inst.state == InstState.SLEPT:
+                return iid
+        return None
+
+    def _choose_evictions_locked(
         self,
         target_set: Tuple[int, ...],
         target_model: str,
-        displaced: Set[str],
         need: Dict[str, int],
-    ) -> Tuple[float, List[Tuple[int, str]], Set[str]]:
-        # Base cost: sleep displaced active models
-        base_cost = 0.0
-        for d in displaced:
-            mi = self.models.get(d)
-            if mi:
-                base_cost += float(need.get(d, 0)) * float(mi.t_wake_s)
-
-        if self._c1_satisfied_locked(target_set, target_model):
-            return base_cost, [], set()
-
-        # Scenario 2: must evict models with smallest Need(.), tie by LRU (oldest first).
-        ops: List[Tuple[int, str]] = []
-        evicted: Set[str] = set()
-
-        tp_target = len(target_set)
-
+    ) -> Tuple[bool, List[str]]:
+        candidates: Set[str] = set()
         for g in target_set:
-            cap = self.gpus[g].weight_cap_MB
-            used = self._estimate_gpu_weight_used_MB_locked(g)
+            for m in self.gpus[g].resident.keys():
+                if m != target_model:
+                    candidates.add(m)
 
-            if not self.gpus[g].is_resident(target_model):
-                used += self._estimate_model_weight_MB_locked(target_model, tp_target, g)
+        evicted: List[str] = []
 
-            excess = used - cap
-            if excess <= 1e-6:
-                continue
+        def score(m: str) -> Tuple[int, float]:
+            n = int(need.get(m, 0))
+            # smaller last_used => older
+            last = min(
+                float(self.gpus[g].last_used.get(m, 0.0))
+                for g in target_set
+                if m in self.gpus[g].last_used
+            ) if candidates else 0.0
+            return (n, last)
 
-            candidates = [m for m in self.gpus[g].resident.keys() if m != target_model]
+        while not self._c1_satisfied_locked(target_set, target_model, evicted_extra=set(evicted)):
             if not candidates:
-                return math.inf, [], set()
+                return False, []
+            m = sorted(candidates, key=score)[0]
+            candidates.discard(m)
+            evicted.append(m)
 
-            def key(m: str) -> Tuple[int, float]:
-                n = int(need.get(m, 0))
-                last = float(self.gpus[g].last_used.get(m, 0.0))  # older = smaller
-                return (n, last)
+        return True, evicted
 
-            candidates.sort(key=key)
-
-            for m in candidates:
-                if excess <= 1e-6:
-                    break
-                tp_m = self.gpus[g].tp_by_model.get(m, self.models.get(m).tp_min if self.models.get(m) else 1)
-                freed = self._estimate_model_weight_MB_locked(m, tp_m, g)
-                ops.append((g, m))
-                evicted.add(m)
-                excess -= freed
-
-            if excess > 1e-6:
-                return math.inf, [], set()
-
-        # Extra penalty for eviction vs sleep
-        delta_cost = 0.0
-        for e in evicted:
-            mi = self.models.get(e)
-            if mi:
-                delta_cost += float(mi.t_offload_s) + float(need.get(e, 0)) * float(mi.t_load_s - mi.t_wake_s)
-
-        return base_cost + delta_cost, ops, evicted
-
-    def _c1_satisfied_locked(self, target_set: Tuple[int, ...], target_model: str) -> bool:
+    def _c1_satisfied_locked(self, target_set: Tuple[int, ...], target_model: str, *, evicted_extra: Set[str]) -> bool:
         tp_target = len(target_set)
         for g in target_set:
-            used = self._estimate_gpu_weight_used_MB_locked(g)
+            used = self._estimate_gpu_weight_used_MB_locked(g, evicted_extra=evicted_extra)
             if not self.gpus[g].is_resident(target_model):
                 used += self._estimate_model_weight_MB_locked(target_model, tp_target, g)
             if used > self.gpus[g].weight_cap_MB + 1e-6:
                 return False
         return True
 
-    def _estimate_gpu_weight_used_MB_locked(self, gpu_id: int) -> float:
+    def _estimate_gpu_weight_used_MB_locked(self, gpu_id: int, *, evicted_extra: Set[str]) -> float:
         used = 0.0
         gi = self.gpus[gpu_id]
-        for m in gi.resident.keys():
+        for m in list(gi.resident.keys()):
+            if m in evicted_extra:
+                continue
             tp = gi.tp_by_model.get(m, self.models.get(m).tp_min if self.models.get(m) else 1)
             used += self._estimate_model_weight_MB_locked(m, tp, gpu_id)
         return used
@@ -778,32 +1046,28 @@ class moa_scheduler:
     # Apply actions
     # -----------------
 
-    def _dispatch_locked(self, r: Request, s: Tuple[int, ...], now: float) -> None:
-        inst = self.instances[s]
-        if inst.state != InstState.ACTIVE or inst.model != r.model or not inst.accept_new:
+    def _dispatch_locked(self, r: Request, iid: str, now: float) -> None:
+        inst = self.instances.get(iid)
+        if not inst or inst.state != InstState.ACTIVE or inst.model != r.model or not inst.accept_new:
             self._requeue_locked(r)
             return
         r.state = ReqState.RUNNING
-        for g in s:
-            self.gpus[g].set_resident(r.model, Residence.ACTIVE, now, tp=len(s))
-        self._spawn(self._run_infer(r, s))
+
+        for g in inst.gpus:
+            self.gpus[g].set_resident(r.model, Residence.ACTIVE, now, pid=inst.pid_by_gpu.get(g), tp=len(inst.gpus), url=inst.base_url)
+
+        self._spawn(self._run_infer(r, iid))
 
     def _requeue_locked(self, r: Request) -> None:
         r.state = ReqState.WAITING
         self._push(self._waiting, r.t_arr, r.key())
 
     def _schedule_switch_locked(self, r: Request, plan: SwitchPlan, now: float) -> None:
-        # Mark overlapped draining (no new requests)
-        for s2 in plan.overlapped_sets:
-            inst2 = self.instances[s2]
-            inst2.accept_new = False
-            if inst2.state == InstState.ACTIVE:
-                inst2.state = InstState.DRAINING
-
-        # Reserve target set
-        inst_t = self.instances[plan.target_set]
-        inst_t.state = InstState.SWITCHING
-        inst_t.accept_new = False
+        for iid in plan.overlapped_active_ids:
+            inst = self.instances.get(iid)
+            if inst and inst.state == InstState.ACTIVE:
+                inst.accept_new = False
+                inst.state = InstState.DRAINING
 
         r.state = ReqState.RUNNING
         self._spawn(self._switch_then_run(r, plan))
@@ -812,11 +1076,16 @@ class moa_scheduler:
     # Background tasks
     # -----------------
 
-    async def _run_infer(self, r: Request, s: Tuple[int, ...]) -> None:
-        try:
-            out = await self.controller.infer(r.model, r.payload, s)
-        except Exception as e:
-            out = {"error": str(e), "model": r.model, "gpu_set": list(s)}
+    async def _run_infer(self, r: Request, iid: str) -> None:
+        async with self._lock:
+            inst = self.instances.get(iid)
+        if not inst:
+            out = {"error": "instance not found", "instance_id": iid}
+        else:
+            try:
+                out = await self.controller.infer(inst, r.payload)
+            except Exception as e:
+                out = {"error": str(e), "instance_id": iid, "model": r.model}
 
         async with self._lock:
             r.state = ReqState.DONE
@@ -828,112 +1097,150 @@ class moa_scheduler:
                 pass
 
     async def _switch_then_run(self, r: Request, plan: SwitchPlan) -> None:
-        # best-effort stop accepting new
-        for s2 in plan.overlapped_sets:
+        async with self._lock:
+            overlapped = [self.instances[iid] for iid in plan.overlapped_active_ids if iid in self.instances]
+            evict_set = set(plan.evict_models)
+
+        # 1) Drain
+        for inst in overlapped:
             try:
-                await self.controller.stop_accepting_new(s2)
+                await self.controller.drain_until_empty(inst)
             except Exception:
                 pass
 
-        # Drain (estimated)
-        await asyncio.sleep(max(0.0, plan.est_drain_s))
-
-        # Deactivate overlapped; apply evictions; stage target weights
-        async with self._lock:
-            now = time.monotonic()
-
-            # sleep overlapped instances
-            for s2 in plan.overlapped_sets:
-                inst2 = self.instances[s2]
-                if inst2.model:
-                    u = inst2.model
-                    self._spawn(self._observe_sleep(inst2))
-                    for g in s2:
-                        pid = inst2.pid_by_gpu.get(g)
-                        self.gpus[g].set_resident(u, Residence.SLEPT, now, pid=pid, tp=len(s2))
-                inst2.model = None
-                inst2.state, inst2.accept_new = InstState.IDLE, True
-
-            # evictions
-            for g, m in plan.evict_ops:
-                pid = self.gpus[g].pid_by_model.get(m)
-                if pid is not None:
-                    self._spawn(self._observe_offload(g, m, int(pid)))
-                self.gpus[g].evict(m)
-
-            # stage target
-            tp_t = len(plan.target_set)
-            for g in plan.target_set:
-                self.gpus[g].set_resident(plan.target_model, Residence.SLEPT, now, tp=tp_t)
-
-            # keep target instance in SWITCHING until activation completes
-            inst_t = self.instances[plan.target_set]
-            inst_t.model = plan.target_model
-            inst_t.state, inst_t.accept_new = InstState.SWITCHING, False
-
-        # Activation timing (EMA update)
-        async with self._lock:
-            is_resident_now = all(self.gpus[g].is_resident(plan.target_model) for g in plan.target_set)
-        kind = "wake" if is_resident_now else "load"
-
-        t0 = time.monotonic()
-        mi = self.models[plan.target_model]
-        await asyncio.sleep(max(0.0, mi.t_wake_s if kind == "wake" else mi.t_load_s))
-        obs = time.monotonic() - t0
-
-        async with self._lock:
-            mi = self.models.get(plan.target_model)
-            if mi:
-                if kind == "wake":
-                    mi.update_wake(obs, ema=self.timing_ema)
-                else:
-                    mi.update_load(obs, ema=self.timing_ema)
-
-            now = time.monotonic()
-            for g in plan.target_set:
-                self.gpus[g].set_resident(plan.target_model, Residence.ACTIVE, now, tp=len(plan.target_set))
-
-            inst_t = self.instances[plan.target_set]
-            inst_t.state, inst_t.accept_new = InstState.ACTIVE, True
-
-        await self._run_infer(r, plan.target_set)
-
-    async def _observe_sleep(self, inst: Instance) -> None:
-        if not inst.model:
-            return
-        model = inst.model
-        tp = len(inst.gpus)
-
-        t_obs = await self.controller.sleep_observe(inst)
-        if t_obs is not None:
-            mi = self.models.get(model)
-            if mi:
-                mi.update_wake(float(t_obs), ema=self.timing_ema)
-
+        # 2) Sleep or kill overlapped
         pid_mem = await self.controller.pid_used_MB()
-        if not pid_mem:
-            return
-        vals: List[int] = []
-        for g in inst.gpus:
-            pid = inst.pid_by_gpu.get(g)
-            if pid is None:
-                continue
-            v = pid_mem.get((g, int(pid)))
-            if v is not None:
-                vals.append(int(v))
-        if not vals:
-            return
-        mi = self.models.get(model)
-        if mi:
-            mi.update_slept_mem(tp, float(sum(vals)) / float(len(vals)), ema=self.timing_ema)
+        async with self._lock:
+            if pid_mem:
+                self._pid_mem = pid_mem
 
-    async def _observe_offload(self, gpu_id: int, model: str, pid: int) -> None:
-        t_obs = await self.controller.offload_observe(gpu_id, pid)
-        if t_obs is None:
-            return
-        mi = self.models.get(model)
-        if mi:
-            mi.update_offload(float(t_obs), ema=self.timing_ema)
+        for inst in overlapped:
+            if inst.model in evict_set:
+                t0 = time.monotonic()
+                try:
+                    elapsed = await self.controller.kill(inst)
+                except Exception:
+                    elapsed = time.monotonic() - t0
+                async with self._lock:
+                    mi = self.models.get(inst.model)
+                    if mi:
+                        mi.update_offload(elapsed, ema=self.timing_ema)
+                    self._remove_instance_locked(inst)
+                continue
+
+            t0 = time.monotonic()
+            try:
+                elapsed = await self.controller.sleep(inst)
+            except Exception:
+                elapsed = time.monotonic() - t0
+
+            pid_mem2 = await self.controller.pid_used_MB()
+            async with self._lock:
+                if pid_mem2:
+                    self._pid_mem = pid_mem2
+
+                mi = self.models.get(inst.model)
+                if mi:
+                    mi.update_sleep(elapsed, ema=self.timing_ema)
+                    vals = []
+                    for g in inst.gpus:
+                        pid = inst.pid_by_gpu.get(g)
+                        if pid is None:
+                            continue
+                        v = self._pid_mem.get((g, int(pid)))
+                        if v is not None:
+                            vals.append(int(v))
+                    if vals:
+                        mi.update_slept_mem(len(inst.gpus), float(sum(vals)) / float(len(vals)), ema=self.timing_ema)
+
+                now = time.monotonic()
+                inst.state = InstState.SLEPT
+                inst.accept_new = False
+                self.active_ids.discard(inst.instance_id)
+                self.slept_ids.add(inst.instance_id)
+                for g in inst.gpus:
+                    self.gpus[g].set_resident(inst.model, Residence.SLEPT, now, pid=inst.pid_by_gpu.get(g), tp=len(inst.gpus), url=inst.base_url)
+
+        # 3) Kill any additional evicted instances
+        async with self._lock:
+            extra_to_kill = [inst for inst in self.instances.values() if inst.model in evict_set and inst.state != InstState.DEAD]
+
+        for inst in extra_to_kill:
+            async with self._lock:
+                if inst.instance_id not in self.instances:
+                    continue
+            t0 = time.monotonic()
+            try:
+                elapsed = await self.controller.kill(inst)
+            except Exception:
+                elapsed = time.monotonic() - t0
+            async with self._lock:
+                mi = self.models.get(inst.model)
+                if mi:
+                    mi.update_offload(elapsed, ema=self.timing_ema)
+                self._remove_instance_locked(inst)
+
+        # 4) Activate target
+        target_inst: Optional[Instance] = None
+        async with self._lock:
+            slept_iid = self._find_slept_instance_locked(plan.target_model, plan.target_set)
+            if slept_iid:
+                target_inst = self.instances.get(slept_iid)
+
+        if target_inst is not None:
+            t0 = time.monotonic()
+            try:
+                elapsed = await self.controller.wake(target_inst)
+            except Exception:
+                elapsed = time.monotonic() - t0
+            async with self._lock:
+                mi = self.models.get(plan.target_model)
+                if mi:
+                    mi.update_wake(elapsed, ema=self.timing_ema)
+                now = time.monotonic()
+                target_inst.state = InstState.ACTIVE
+                target_inst.accept_new = True
+                self.slept_ids.discard(target_inst.instance_id)
+                self.active_ids.add(target_inst.instance_id)
+                for g in plan.target_set:
+                    self.gpus[g].set_resident(plan.target_model, Residence.ACTIVE, now, pid=target_inst.pid_by_gpu.get(g), tp=len(plan.target_set), url=target_inst.base_url)
+        else:
+            tp = len(plan.target_set)
+            gpu_util = ManagedVLLMController.compute_gpu_mem_util(plan.target_set) if isinstance(self.controller, ManagedVLLMController) else 0.9
+
+            t0 = time.monotonic()
+            new_inst = await self.controller.start(plan.target_model, plan.target_set, tp=tp, gpu_mem_util=gpu_util)
+            elapsed = time.monotonic() - t0
+
+            async with self._lock:
+                mi = self.models.get(plan.target_model)
+                if mi:
+                    mi.update_load(elapsed, ema=self.timing_ema)
+
+                self.instances[new_inst.instance_id] = new_inst
+                self.active_ids.add(new_inst.instance_id)
+                self.slept_ids.discard(new_inst.instance_id)
+                now = time.monotonic()
+                for g in new_inst.gpus:
+                    self.gpus[g].set_resident(plan.target_model, Residence.ACTIVE, now, pid=new_inst.pid_by_gpu.get(g), tp=len(new_inst.gpus), url=new_inst.base_url)
+
+            target_inst = new_inst
+
+        # 5) Dispatch
+        async with self._lock:
+            if not target_inst:
+                r.state = ReqState.DONE
+                return
+            iid = target_inst.instance_id
+        await self._run_infer(r, iid)
+
+    def _remove_instance_locked(self, inst: Instance) -> None:
+        inst.state = InstState.DEAD
+        self.active_ids.discard(inst.instance_id)
+        self.slept_ids.discard(inst.instance_id)
+        self.instances.pop(inst.instance_id, None)
+        for g in inst.gpus:
+            self.gpus[g].evict_model(inst.model)
 
     # -----------------
     # Utilities

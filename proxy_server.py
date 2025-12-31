@@ -12,8 +12,12 @@ from huggingface_hub import HfApi, hf_hub_download
 import sys, pathlib as _pathlib
 sys.path.append(str(_pathlib.Path(__file__).resolve().parent))
 
-from MoA_Scheduler import GPUInfo, ModelInfo, Request, moa_scheduler, SimVLLMController, RealVLLMController
+from MoA_Scheduler import GPUInfo, ModelInfo, Request, moa_scheduler, Instance, ManagedVLLMController
 
+
+# -----------------------
+# GPU & GPU-set discovery
+# -----------------------
 
 def discover_gpus(alpha: float) -> List[GPUInfo]:
     out = subprocess.check_output(
@@ -41,6 +45,10 @@ def build_hierarchical_sets(gpu_ids: List[int]) -> List[Tuple[int, ...]]:
         size *= 2
     return sorted(sets, key=lambda s: (len(s), s))
 
+
+# -----------------------
+# Model card persistence
+# -----------------------
 
 def read_model_card(path: str) -> Dict[str, Dict[str, Any]]:
     if not os.path.exists(path):
@@ -80,6 +88,7 @@ def load_model_card(path: str) -> Dict[str, ModelInfo]:
             name=name,
             tp_min=tp_min,
             t_wake_s=float(cfg.get("t_wake_s", 2.0)),
+            t_sleep_s=float(cfg.get("t_sleep_s", 2.0)),
             t_load_s=float(cfg.get("t_load_s", 90.0)),
             t_offload_s=float(cfg.get("t_offload_s", 3.0)),
             slept_mem_MB_tp1=float(cfg.get("slept_mem_MB_tp1", 2048.0)),
@@ -156,6 +165,7 @@ async def ensure_model(scheduler: moa_scheduler, model_id: str, gpus: List[GPUIn
         name=model_id,
         tp_min=tp_min,
         t_wake_s=2.0,
+        t_sleep_s=2.0,
         t_load_s=90.0,
         t_offload_s=3.0,
         slept_mem_MB_tp1=2048.0,
@@ -167,6 +177,7 @@ async def ensure_model(scheduler: moa_scheduler, model_id: str, gpus: List[GPUIn
     data[model_id] = {
         "tp_min": tp_min,
         "t_wake_s": 2.0,
+        "t_sleep_s": 2.0,
         "t_load_s": 90.0,
         "t_offload_s": 3.0,
         "slept_mem_MB_tp1": 2048.0,
@@ -245,7 +256,21 @@ class JobGraph:
     def payload(self, node: str) -> Any:
         base = self.inputs.get(node, {})
         parent_out = {p: self.outputs[p] for p in self.parents[node]}
-        return {"node_id": node, "model": self.model_of(node), "base": base, "parents": parent_out}
+        if isinstance(base, dict) and ("prompt" in base or "messages" in base):
+            base = dict(base)
+            base.setdefault("metadata", {})
+            if isinstance(base["metadata"], dict):
+                base["metadata"]["parents"] = parent_out
+                base["metadata"]["node_id"] = node
+            return base
+        return {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": json.dumps({"node_id": node, "base": base, "parents": parent_out}),
+                }
+            ]
+        }
 
     def make_req(self, node: str) -> Request:
         return Request(
@@ -264,10 +289,7 @@ class JobGraph:
 
 class SubmitBody(BaseModel):
     graph: Dict[str, List[str]] = Field(..., description="Adjacency list over node_ids (stages).")
-    node_models: Optional[Dict[str, str]] = Field(
-        default=None,
-        description="Optional map node_id -> model_id. If omitted, node_id is treated as model_id."
-    )
+    node_models: Optional[Dict[str, str]] = Field(default=None, description="node_id -> model_id (allows repeated models). If omitted, node_id is treated as model_id.")
     inputs: Optional[Dict[str, Any]] = Field(default=None)
     job_id: Optional[str] = Field(default=None)
 
@@ -290,16 +312,17 @@ class StatusResp(BaseModel):
 class RegisterInstanceBody(BaseModel):
     gpu_set: List[int]
     model: str
-    pid_by_gpu: Dict[str, int] = Field(..., description="Map gpu_id (string) -> pid")
-    metrics_url: Optional[str] = Field(default=None)
+    port: int
+    pid_by_gpu: Dict[str, int] = Field(..., description="Map gpu_id -> pid")
 
 
 ALPHA = float(os.getenv("ALPHA", "0.4"))
 BETA = float(os.getenv("BETA", "1.0"))
 INTERVAL_S = float(os.getenv("SCHED_INTERVAL_S", "1.0"))
 MODEL_CARD_PATH = os.getenv("MODEL_CARD_PATH", "model_card.json")
-DEFAULT_VLLM_METRICS_URL = os.getenv("VLLM_METRICS_URL", "http://127.0.0.1:8001/metrics")
-SIMULATE = os.getenv("SIMULATE", "1") == "1"
+
+VLLM_HOST = os.getenv("VLLM_HOST", "127.0.0.1")
+VLLM_PORT_BASE = int(os.getenv("VLLM_PORT_BASE", "9000"))
 
 scheduler: Optional[moa_scheduler] = None
 jobs: Dict[str, JobGraph] = {}
@@ -315,7 +338,7 @@ async def lifespan(app: FastAPI):
 
     models = load_model_card(MODEL_CARD_PATH)
 
-    controller = SimVLLMController(models) if SIMULATE else RealVLLMController(default_metrics_url=DEFAULT_VLLM_METRICS_URL)
+    controller = ManagedVLLMController(host=VLLM_HOST, port_base=VLLM_PORT_BASE)
 
     scheduler = moa_scheduler(
         gpus=gpu_snapshot,
@@ -329,7 +352,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="MoA Proxy Server", version="0.3", lifespan=lifespan)
+app = FastAPI(title="MoA Proxy Server", version="0.4", lifespan=lifespan)
 
 
 async def _sched_loop() -> None:
@@ -342,6 +365,7 @@ async def _sched_loop() -> None:
 
 @app.post("/register_instance")
 async def register_instance(body: RegisterInstanceBody) -> Dict[str, Any]:
+    """Optional: attach an already-running vLLM server to the scheduler."""
     if scheduler is None:
         raise HTTPException(status_code=503, detail="scheduler not ready")
 
@@ -351,12 +375,17 @@ async def register_instance(body: RegisterInstanceBody) -> Dict[str, Any]:
     if body.model not in scheduler.models:
         await ensure_model(scheduler, body.model, gpu_snapshot, MODEL_CARD_PATH, alpha=ALPHA)
 
-    try:
-        await scheduler.register_active_instance(gpu_set, body.model, pid_by_gpu, metrics_url=body.metrics_url or "")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    return {"ok": True, "gpu_set": list(gpu_set), "model": body.model}
+    base_url = f"http://{VLLM_HOST}:{int(body.port)}"
+    inst = Instance(
+        instance_id=f"{','.join(map(str, gpu_set))}|{body.model}|{int(body.port)}",
+        gpus=gpu_set,
+        model=body.model,
+        base_url=base_url,
+        metrics_url=f"{base_url}/metrics",
+        pid_by_gpu=pid_by_gpu,
+    )
+    await scheduler.register_existing_instance(inst)
+    return {"ok": True, "instance_id": inst.instance_id, "base_url": base_url}
 
 
 @app.post("/submit_graph", response_model=SubmitResp)
@@ -413,6 +442,57 @@ async def status(job_id: str) -> StatusResp:
 # -----------------------
 # Callbacks
 # -----------------------
+
+@app.get("/instances")
+async def instances() -> Dict[str, Any]:
+    """List known vLLM server processes with PID, URL, state, and live queue/latency."""
+    if scheduler is None:
+        raise HTTPException(status_code=503, detail="scheduler not ready")
+
+    async with scheduler._lock:  # type: ignore[attr-defined]
+        insts = list(scheduler.instances.values())
+
+    snaps = await asyncio.gather(*[scheduler.controller.metrics(i) for i in insts], return_exceptions=True)
+    out = []
+    for inst, snap in zip(insts, snaps):
+        if isinstance(snap, Exception):
+            snap = None
+        out.append({
+            "instance_id": inst.instance_id,
+            "model": inst.model,
+            "gpus": list(inst.gpus),
+            "base_url": inst.base_url,
+            "metrics_url": inst.metrics_url,
+            "state": inst.state,
+            "accept_new": inst.accept_new,
+            "pid_by_gpu": {str(k): int(v) for k, v in inst.pid_by_gpu.items()},
+            "num_requests": getattr(snap, "num_requests", None),
+            "e2e_sum": getattr(snap, "e2e_sum", None),
+            "e2e_count": getattr(snap, "e2e_count", None),
+            "avg_latency": getattr(snap, "avg_latency", None),
+        })
+
+    return {"instances": out}
+
+
+@app.get("/model_stats")
+async def model_stats() -> Dict[str, Any]:
+    """Return current EMA timing/memory stats per model in the scheduler."""
+    if scheduler is None:
+        raise HTTPException(status_code=503, detail="scheduler not ready")
+    ms = {}
+    for name, mi in scheduler.models.items():
+        ms[name] = {
+            "tp_min": mi.tp_min,
+            "t_wake_s": mi.t_wake_s,
+            "t_sleep_s": mi.t_sleep_s,
+            "t_load_s": mi.t_load_s,
+            "t_offload_s": mi.t_offload_s,
+            "slept_mem_MB_tp1": mi.slept_mem_MB_tp1,
+            "slept_mem_MB_tpgt1": mi.slept_mem_MB_tpgt1,
+        }
+    return {"models": ms}
+
 
 def _on_dispatched(job: JobGraph, req: Request) -> List[Request]:
     """
