@@ -22,8 +22,8 @@ def discover_gpus(alpha: float) -> List[GPUInfo]:
     ).strip()
     gpus: List[GPUInfo] = []
     for line in out.splitlines():
-        idx_s, mem_mib_s = [x.strip() for x in line.split(",")]
-        gpus.append(GPUInfo(int(idx_s), int(mem_mib_s), alpha))
+        idx_s, mem_MB_s = [x.strip() for x in line.split(",")]
+        gpus.append(GPUInfo(int(idx_s), int(mem_MB_s), alpha))
     if not gpus:
         raise RuntimeError("no GPUs from nvidia-smi")
     return sorted(gpus, key=lambda g: g.gpu_id)
@@ -64,10 +64,10 @@ def load_model_card(path: str) -> Dict[str, ModelInfo]:
         "t_wake_s": 2,
         "t_load_s": 90,
         "t_offload_s": 3,
-        "slept_mem_mib_tp1": 2048,
-        "slept_mem_mib_tpgt1": 4096,
+        "slept_mem_MB_tp1": 2048,
+        "slept_mem_MB_tpgt1": 4096,
         "avg_service_s": 0.2,
-        "size_gb": 14            # optional (only used to guess tp_min when missing)
+        "size_MB": 8192            # optional (only used to guess tp_min when missing)
       },
       ...
     }
@@ -82,14 +82,14 @@ def load_model_card(path: str) -> Dict[str, ModelInfo]:
             t_wake_s=float(cfg.get("t_wake_s", 2.0)),
             t_load_s=float(cfg.get("t_load_s", 90.0)),
             t_offload_s=float(cfg.get("t_offload_s", 3.0)),
-            slept_mem_mib_tp1=float(cfg.get("slept_mem_mib_tp1", 2048.0)),
-            slept_mem_mib_tpgt1=float(cfg.get("slept_mem_mib_tpgt1", 4096.0)),
+            slept_mem_MB_tp1=float(cfg.get("slept_mem_MB_tp1", 2048.0)),
+            slept_mem_MB_tpgt1=float(cfg.get("slept_mem_MB_tpgt1", 4096.0)),
             avg_service_s=float(cfg.get("avg_service_s", 0.2)),
         )
     return models
 
 
-def hf_guess_model_size_gb(repo_id: str) -> float:
+def hf_guess_model_size_MB(repo_id: str) -> float:
     '''
     Best-effort model size estimate from HF repo metadata.
     Prefers safetensors/bin weights sizes; falls back to index.json metadata.
@@ -107,7 +107,7 @@ def hf_guess_model_size_gb(repo_id: str) -> float:
             if fn.endswith(".safetensors") or fn.endswith(".bin"):
                 total += int(s.size)
         if total > 0:
-            return float(total) / float(1024**3)
+            return float(total) / float(1024**2)
     except Exception:
         pass
 
@@ -119,21 +119,20 @@ def hf_guess_model_size_gb(repo_id: str) -> float:
                 j = json.load(f)
             total_size = j.get("metadata", {}).get("total_size", 0)
             if total_size:
-                return float(total_size) / float(1024**3)
+                return float(total_size) / float(1024**2)
         except Exception:
             continue
 
     raise RuntimeError(f"Couldn't determine model size for {repo_id} from Hugging Face")
 
 
-def choose_tp_min_homogeneous(size_gb: float, gpus: List[GPUInfo]) -> int:
+def choose_tp_min_homogeneous(size_MB: float, gpus: List[GPUInfo]) -> int:
     if not gpus:
         return 1
-    min_vram_mib = min(g.vram_total_mib for g in gpus)
-    if min_vram_mib <= 0:
+    min_vram_MB = min(g.vram_total_MB for g in gpus)
+    if min_vram_MB <= 0:
         return 1
-    size_mib = float(size_gb) * 1024.0
-    raw = int(math.ceil(size_mib / min_vram_mib))
+    raw = int(math.ceil(size_MB / min_vram_MB))
     raw = max(1, raw)
     tp = 1
     while tp < raw:
@@ -143,15 +142,15 @@ def choose_tp_min_homogeneous(size_gb: float, gpus: List[GPUInfo]) -> int:
 
 async def ensure_model(scheduler: moa_scheduler, model_id: str, gpus: List[GPUInfo], model_card_path: str) -> None:
     '''
-    If model isn't in scheduler.models, pull size_gb from HuggingFace, choose tp_min, set defaults:
+    If model isn't in scheduler.models, pull size_MB from HuggingFace, choose tp_min, set defaults:
       t_wake_s=2, t_load_s=90, t_offload_s=3.
     Also persist to model_card.json for next runs.
     '''
     if model_id in scheduler.models:
         return
 
-    size_gb = hf_guess_model_size_gb(model_id)
-    tp_min = choose_tp_min_homogeneous(size_gb, gpus)
+    size_MB = hf_guess_model_size_MB(model_id)
+    tp_min = choose_tp_min_homogeneous(size_MB, gpus)
 
     scheduler.models[model_id] = ModelInfo(
         name=model_id,
@@ -159,8 +158,8 @@ async def ensure_model(scheduler: moa_scheduler, model_id: str, gpus: List[GPUIn
         t_wake_s=2.0,
         t_load_s=90.0,
         t_offload_s=3.0,
-        slept_mem_mib_tp1=2048.0,
-        slept_mem_mib_tpgt1=4096.0,
+        slept_mem_MB_tp1=2048.0,
+        slept_mem_MB_tpgt1=4096.0,
         avg_service_s=0.2,
     )
 
@@ -170,12 +169,12 @@ async def ensure_model(scheduler: moa_scheduler, model_id: str, gpus: List[GPUIn
         "t_wake_s": 2.0,
         "t_load_s": 90.0,
         "t_offload_s": 3.0,
-        "slept_mem_mib_tp1": 2048.0,
-        "slept_mem_mib_tpgt1": 4096.0,
+        "slept_mem_MB_tp1": 2048.0,
+        "slept_mem_MB_tpgt1": 4096.0,
         "avg_service_s": 0.2,
     }
-    if size_gb is not None:
-        data[model_id]["size_gb"] = size_gb
+    if size_MB is not None:
+        data[model_id]["size_MB"] = size_MB
     write_model_card(model_card_path, data)
 
 

@@ -39,10 +39,9 @@ class ModelInfo:
         which is updated when we actually sleep a model (via nvidia-smi pid used_memory).
 
     Defaults requested:
-      - slept_mem_mib_tp1 = 2048
-      - slept_mem_mib_tpgt1 = 4096
-      - t_wake_s = 2, t_load_s = 90
-      - t_offload_s = 3
+      - slept_mem_MB_tp1 = 2048
+      - slept_mem_MB_tpgt1 = 4096
+      - t_wake_s = 2, t_load_s = 90, t_offload_s = 3
     """
     name: str
     tp_min: int
@@ -52,15 +51,15 @@ class ModelInfo:
     t_load_s: float = 90.0
     t_offload_s: float = 3.0
 
-    # Online "slept weights" footprint (MiB per GPU)
-    slept_mem_mib_tp1: float = 2048.0
-    slept_mem_mib_tpgt1: float = 4096.0
+    # Online "slept weights" footprint (MB per GPU)
+    slept_mem_MB_tp1: float = 2048.0
+    slept_mem_MB_tpgt1: float = 4096.0
 
     # Simulator-only (optional)
     avg_service_s: float = 0.2
 
-    def slept_mem_mib(self, tp: int) -> float:
-        return float(self.slept_mem_mib_tp1 if int(tp) <= 1 else self.slept_mem_mib_tpgt1)
+    def slept_mem_MB(self, tp: int) -> float:
+        return float(self.slept_mem_MB_tp1 if int(tp) <= 1 else self.slept_mem_MB_tpgt1)
 
     def update_wake(self, observed_s: float, ema: float = 0.2) -> None:
         self.t_wake_s = max(1e-3, (1.0 - ema) * float(self.t_wake_s) + ema * float(observed_s))
@@ -71,18 +70,18 @@ class ModelInfo:
     def update_offload(self, observed_s: float, ema: float = 0.2) -> None:
         self.t_offload_s = max(1e-3, (1.0 - ema) * float(self.t_offload_s) + ema * float(observed_s))
 
-    def update_slept_mem(self, tp: int, observed_mib_per_gpu: float, ema: float = 0.2) -> None:
-        v = max(1.0, float(observed_mib_per_gpu))
+    def update_slept_mem(self, tp: int, observed_MB_per_gpu: float, ema: float = 0.2) -> None:
+        v = max(1.0, float(observed_MB_per_gpu))
         if int(tp) <= 1:
-            self.slept_mem_mib_tp1 = (1.0 - ema) * float(self.slept_mem_mib_tp1) + ema * v
+            self.slept_mem_MB_tp1 = (1.0 - ema) * float(self.slept_mem_MB_tp1) + ema * v
         else:
-            self.slept_mem_mib_tpgt1 = (1.0 - ema) * float(self.slept_mem_mib_tpgt1) + ema * v
+            self.slept_mem_MB_tpgt1 = (1.0 - ema) * float(self.slept_mem_MB_tpgt1) + ema * v
 
 
 @dataclass
 class GPUInfo:
     gpu_id: int
-    vram_total_mib: int
+    vram_total_MB: int
     alpha: float
 
     # model -> ACTIVE/SLEPT, absent means evicted
@@ -97,8 +96,8 @@ class GPUInfo:
     last_used: Dict[str, float] = field(default_factory=dict)
 
     @property
-    def weight_cap_mib(self) -> float:
-        return self.alpha * float(self.vram_total_mib)
+    def weight_cap_MB(self) -> float:
+        return self.alpha * float(self.vram_total_MB)
 
     def set_resident(self, model: str, st: Residence, now: float, *, pid: Optional[int] = None, tp: Optional[int] = None) -> None:
         self.resident[model] = st
@@ -207,7 +206,7 @@ class VLLMController:
     async def metrics(self, instance: Instance) -> MetricsSnapshot:
         return MetricsSnapshot()
 
-    async def pid_used_mib(self) -> Dict[Tuple[int, int], int]:
+    async def pid_used_MB(self) -> Dict[Tuple[int, int], int]:
         return {}
 
     async def sleep_observe(self, instance: Instance) -> Optional[float]:
@@ -294,11 +293,11 @@ class RealVLLMController(VLLMController):
         c = pick("vllm:e2e_request_latency_seconds_count")
         return MetricsSnapshot(num_requests=num, e2e_sum=s, e2e_count=c)
 
-    async def pid_used_mib(self) -> Dict[Tuple[int, int], int]:
-        return await asyncio.to_thread(self._pid_used_mib_sync)
+    async def pid_used_MB(self) -> Dict[Tuple[int, int], int]:
+        return await asyncio.to_thread(self._pid_used_MB_sync)
 
     @staticmethod
-    def _pid_used_mib_sync() -> Dict[Tuple[int, int], int]:
+    def _pid_used_MB_sync() -> Dict[Tuple[int, int], int]:
         uuid_to_idx: Dict[str, int] = {}
         try:
             out = subprocess.check_output(
@@ -540,7 +539,7 @@ class moa_scheduler:
             for inst, snap in zip(inst_list, snaps):
                 metrics_map[inst.gpus] = snap if not isinstance(snap, Exception) else MetricsSnapshot()
 
-        pid_mem = await self.controller.pid_used_mib()
+        pid_mem = await self.controller.pid_used_MB()
 
         async with self._lock:
             if pid_mem:
@@ -704,11 +703,11 @@ class moa_scheduler:
         tp_target = len(target_set)
 
         for g in target_set:
-            cap = self.gpus[g].weight_cap_mib
-            used = self._estimate_gpu_weight_used_mib_locked(g)
+            cap = self.gpus[g].weight_cap_MB
+            used = self._estimate_gpu_weight_used_MB_locked(g)
 
             if not self.gpus[g].is_resident(target_model):
-                used += self._estimate_model_weight_mib_locked(target_model, tp_target, g)
+                used += self._estimate_model_weight_MB_locked(target_model, tp_target, g)
 
             excess = used - cap
             if excess <= 1e-6:
@@ -729,7 +728,7 @@ class moa_scheduler:
                 if excess <= 1e-6:
                     break
                 tp_m = self.gpus[g].tp_by_model.get(m, self.models.get(m).tp_min if self.models.get(m) else 1)
-                freed = self._estimate_model_weight_mib_locked(m, tp_m, g)
+                freed = self._estimate_model_weight_MB_locked(m, tp_m, g)
                 ops.append((g, m))
                 evicted.add(m)
                 excess -= freed
@@ -749,22 +748,22 @@ class moa_scheduler:
     def _c1_satisfied_locked(self, target_set: Tuple[int, ...], target_model: str) -> bool:
         tp_target = len(target_set)
         for g in target_set:
-            used = self._estimate_gpu_weight_used_mib_locked(g)
+            used = self._estimate_gpu_weight_used_MB_locked(g)
             if not self.gpus[g].is_resident(target_model):
-                used += self._estimate_model_weight_mib_locked(target_model, tp_target, g)
-            if used > self.gpus[g].weight_cap_mib + 1e-6:
+                used += self._estimate_model_weight_MB_locked(target_model, tp_target, g)
+            if used > self.gpus[g].weight_cap_MB + 1e-6:
                 return False
         return True
 
-    def _estimate_gpu_weight_used_mib_locked(self, gpu_id: int) -> float:
+    def _estimate_gpu_weight_used_MB_locked(self, gpu_id: int) -> float:
         used = 0.0
         gi = self.gpus[gpu_id]
         for m in gi.resident.keys():
             tp = gi.tp_by_model.get(m, self.models.get(m).tp_min if self.models.get(m) else 1)
-            used += self._estimate_model_weight_mib_locked(m, tp, gpu_id)
+            used += self._estimate_model_weight_MB_locked(m, tp, gpu_id)
         return used
 
-    def _estimate_model_weight_mib_locked(self, model: str, tp: int, gpu_id: int) -> float:
+    def _estimate_model_weight_MB_locked(self, model: str, tp: int, gpu_id: int) -> float:
         pid = self.gpus[gpu_id].pid_by_model.get(model)
         if pid is not None:
             v = self._pid_mem.get((gpu_id, int(pid)))
@@ -773,7 +772,7 @@ class moa_scheduler:
         mi = self.models.get(model)
         if not mi:
             return 4096.0 if int(tp) > 1 else 2048.0
-        return float(mi.slept_mem_mib(int(tp)))
+        return float(mi.slept_mem_MB(int(tp)))
 
     # -----------------
     # Apply actions
@@ -911,7 +910,7 @@ class moa_scheduler:
             if mi:
                 mi.update_wake(float(t_obs), ema=self.timing_ema)
 
-        pid_mem = await self.controller.pid_used_mib()
+        pid_mem = await self.controller.pid_used_MB()
         if not pid_mem:
             return
         vals: List[int] = []
