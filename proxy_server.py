@@ -8,9 +8,11 @@ from fastapi import FastAPI, HTTPException
 from contextlib import asynccontextmanager
 from pydantic import BaseModel, Field
 from huggingface_hub import HfApi, hf_hub_download
+
 import sys, pathlib as _pathlib
 sys.path.append(str(_pathlib.Path(__file__).resolve().parent))
-from MoA_Scheduler import GPUInfo, ModelInfo, Request, moa_scheduler, SimVLLMController
+
+from MoA_Scheduler import GPUInfo, ModelInfo, Request, moa_scheduler, SimVLLMController, RealVLLMController
 
 
 def discover_gpus(alpha: float) -> List[GPUInfo]:
@@ -21,14 +23,14 @@ def discover_gpus(alpha: float) -> List[GPUInfo]:
     gpus: List[GPUInfo] = []
     for line in out.splitlines():
         idx_s, mem_mib_s = [x.strip() for x in line.split(",")]
-        gpus.append(GPUInfo(int(idx_s), int(mem_mib_s) * 1024 * 1024, alpha))
+        gpus.append(GPUInfo(int(idx_s), int(mem_mib_s), alpha))
     if not gpus:
         raise RuntimeError("no GPUs from nvidia-smi")
     return sorted(gpus, key=lambda g: g.gpu_id)
 
 
 def build_hierarchical_sets(gpu_ids: List[int]) -> List[Tuple[int, ...]]:
-    '''Hierarchical sets: TP 1/2/4/8/... aligned by index.'''
+    """Hierarchical sets: TP 1/2/4/8/... aligned by index."""
     sets: Set[Tuple[int, ...]] = set((gid,) for gid in gpu_ids)
     n, size = len(gpu_ids), 2
     while size <= n:
@@ -38,13 +40,6 @@ def build_hierarchical_sets(gpu_ids: List[int]) -> List[Tuple[int, ...]]:
                 sets.add(tuple(chunk))
         size *= 2
     return sorted(sets, key=lambda s: (len(s), s))
-
-
-def _nearest_pow2_ge(x: int) -> int:
-    p = 1
-    while p < x:
-        p <<= 1
-    return p
 
 
 def read_model_card(path: str) -> Dict[str, Dict[str, Any]]:
@@ -62,23 +57,33 @@ def write_model_card(path: str, data: Dict[str, Dict[str, Any]]) -> None:
 
 
 def load_model_card(path: str) -> Dict[str, ModelInfo]:
-    '''
-    model_card.json format (flat dict):
+    """model_card.json format:
     {
-      "repo_id": {"size_gb": 14, "tp_min": 1, "t_wake_s": 2, "t_load_s": 90, "avg_service_s": 0.25},
+      "repo_or_name": {
+        "tp_min": 1,
+        "t_wake_s": 2,
+        "t_load_s": 90,
+        "t_offload_s": 3,
+        "slept_mem_mib_tp1": 2048,
+        "slept_mem_mib_tpgt1": 4096,
+        "avg_service_s": 0.2,
+        "size_gb": 14            # optional (only used to guess tp_min when missing)
+      },
       ...
     }
-    '''
+    """
     data = read_model_card(path)
     models: Dict[str, ModelInfo] = {}
     for name, cfg in data.items():
-        size_gb = float(cfg["size_gb"])
+        tp_min = int(cfg.get("tp_min", 1))
         models[name] = ModelInfo(
             name=name,
-            size_bytes=int(size_gb * (1024**3)),
-            tp_min=int(cfg["tp_min"]),
+            tp_min=tp_min,
             t_wake_s=float(cfg.get("t_wake_s", 2.0)),
             t_load_s=float(cfg.get("t_load_s", 90.0)),
+            t_offload_s=float(cfg.get("t_offload_s", 3.0)),
+            slept_mem_mib_tp1=float(cfg.get("slept_mem_mib_tp1", 2048.0)),
+            slept_mem_mib_tpgt1=float(cfg.get("slept_mem_mib_tpgt1", 4096.0)),
             avg_service_s=float(cfg.get("avg_service_s", 0.2)),
         )
     return models
@@ -121,54 +126,56 @@ def hf_guess_model_size_gb(repo_id: str) -> float:
     raise RuntimeError(f"Couldn't determine model size for {repo_id} from Hugging Face")
 
 
-def choose_tp_min_homogeneous(size_bytes: int, gpus: List[GPUInfo]) -> int:
-    '''
-    Homogeneous single-node assumption:
-      shard_bytes = size_bytes / tp
-      require shard_bytes <= alpha * min_vram
-      tp_min = ceil(size_bytes / (alpha*min_vram)), rounded up to power-of-two for hierarchical sets.
-    '''
-    min_vram = min(g.vram_total_bytes for g in gpus)
-    if min_vram <= 0:
+def choose_tp_min_homogeneous(size_gb: float, gpus: List[GPUInfo]) -> int:
+    if not gpus:
         return 1
-    raw = int(math.ceil(float(size_bytes) / min_vram))
+    min_vram_mib = min(g.vram_total_mib for g in gpus)
+    if min_vram_mib <= 0:
+        return 1
+    size_mib = float(size_gb) * 1024.0
+    raw = int(math.ceil(size_mib / min_vram_mib))
     raw = max(1, raw)
-    tp = _nearest_pow2_ge(raw)
-    if tp > len(gpus):
-        tp = len(gpus)
-    return max(1, tp)
+    tp = 1
+    while tp < raw:
+        tp <<= 1
+    return min(tp, len(gpus))
 
 
-async def ensure_model(sched: moa_scheduler, model_id: str, gpus: List[GPUInfo], model_card_path: str) -> None:
+async def ensure_model(scheduler: moa_scheduler, model_id: str, gpus: List[GPUInfo], model_card_path: str) -> None:
     '''
-    If model isn't in sched.models, pull size_gb from HuggingFace, choose tp_min, set defaults:
-      t_wake_s=2, t_load_s=90.
+    If model isn't in scheduler.models, pull size_gb from HuggingFace, choose tp_min, set defaults:
+      t_wake_s=2, t_load_s=90, t_offload_s=3.
     Also persist to model_card.json for next runs.
     '''
-    if model_id in sched.models:
+    if model_id in scheduler.models:
         return
 
     size_gb = hf_guess_model_size_gb(model_id)
-    size_bytes = int(size_gb * (1024**3))
-    tp_min = choose_tp_min_homogeneous(size_bytes, gpus)
+    tp_min = choose_tp_min_homogeneous(size_gb, gpus)
 
-    sched.models[model_id] = ModelInfo(
+    scheduler.models[model_id] = ModelInfo(
         name=model_id,
-        size_bytes=size_bytes,
         tp_min=tp_min,
         t_wake_s=2.0,
         t_load_s=90.0,
+        t_offload_s=3.0,
+        slept_mem_mib_tp1=2048.0,
+        slept_mem_mib_tpgt1=4096.0,
         avg_service_s=0.2,
     )
 
     data = read_model_card(model_card_path)
     data[model_id] = {
-        "size_gb": size_gb,
         "tp_min": tp_min,
         "t_wake_s": 2.0,
         "t_load_s": 90.0,
+        "t_offload_s": 3.0,
+        "slept_mem_mib_tp1": 2048.0,
+        "slept_mem_mib_tpgt1": 4096.0,
         "avg_service_s": 0.2,
     }
+    if size_gb is not None:
+        data[model_id]["size_gb"] = size_gb
     write_model_card(model_card_path, data)
 
 
@@ -187,9 +194,9 @@ class JobGraph:
     indegree: Dict[str, int] = field(default_factory=dict)
     parents: Dict[str, List[str]] = field(default_factory=dict)
 
-    discovered: Set[str] = field(default_factory=set)                   # node_ids inserted into scheduler
-    completed: Set[str] = field(default_factory=set)                    # node_ids completed
-    outputs: Dict[str, Any] = field(default_factory=dict)               # node_id -> output
+    discovered: Set[str] = field(default_factory=set)
+    completed: Set[str] = field(default_factory=set)
+    outputs: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         all_nodes: Set[str] = set(self.graph.keys())
@@ -281,10 +288,19 @@ class StatusResp(BaseModel):
     outputs: Dict[str, Any]
 
 
+class RegisterInstanceBody(BaseModel):
+    gpu_set: List[int]
+    model: str
+    pid_by_gpu: Dict[str, int] = Field(..., description="Map gpu_id (string) -> pid")
+    metrics_url: Optional[str] = Field(default=None)
+
+
 ALPHA = float(os.getenv("ALPHA", "0.4"))
 BETA = float(os.getenv("BETA", "1.0"))
 INTERVAL_S = float(os.getenv("SCHED_INTERVAL_S", "1.0"))
 MODEL_CARD_PATH = os.getenv("MODEL_CARD_PATH", "model_card.json")
+DEFAULT_VLLM_METRICS_URL = os.getenv("VLLM_METRICS_URL", "http://127.0.0.1:8001/metrics")
+SIMULATE = os.getenv("SIMULATE", "1") == "1"
 
 scheduler: Optional[moa_scheduler] = None
 jobs: Dict[str, JobGraph] = {}
@@ -294,24 +310,27 @@ gpu_snapshot: List[GPUInfo] = []
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global scheduler, gpu_snapshot
+
     gpu_snapshot = discover_gpus(ALPHA)
     sets = build_hierarchical_sets([g.gpu_id for g in gpu_snapshot])
 
     models = load_model_card(MODEL_CARD_PATH)
+
+    controller = SimVLLMController(models) if SIMULATE else RealVLLMController(default_metrics_url=DEFAULT_VLLM_METRICS_URL)
+
     scheduler = moa_scheduler(
         gpus=gpu_snapshot,
         gpu_sets=sets,
         models=models,
-        alpha=ALPHA,
         beta=BETA,
-        controller=SimVLLMController(models),
+        controller=controller,
     )
 
     asyncio.create_task(_sched_loop())
     yield
 
 
-app = FastAPI(title="MoA Proxy Server", version="0.2", lifespan=lifespan)
+app = FastAPI(title="MoA Proxy Server", version="0.3", lifespan=lifespan)
 
 
 async def _sched_loop() -> None:
@@ -320,6 +339,25 @@ async def _sched_loop() -> None:
         await scheduler.move_ready_potential_to_waiting()
         await scheduler.step()
         await asyncio.sleep(INTERVAL_S)
+
+
+@app.post("/register_instance")
+async def register_instance(body: RegisterInstanceBody) -> Dict[str, Any]:
+    if scheduler is None:
+        raise HTTPException(status_code=503, detail="scheduler not ready")
+
+    gpu_set = tuple(int(x) for x in body.gpu_set)
+    pid_by_gpu = {int(k): int(v) for k, v in body.pid_by_gpu.items()}
+
+    if body.model not in scheduler.models:
+        await ensure_model(scheduler, body.model, gpu_snapshot, MODEL_CARD_PATH, alpha=ALPHA)
+
+    try:
+        await scheduler.register_active_instance(gpu_set, body.model, pid_by_gpu, metrics_url=body.metrics_url or "")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {"ok": True, "gpu_set": list(gpu_set), "model": body.model}
 
 
 @app.post("/submit_graph", response_model=SubmitResp)
@@ -339,10 +377,7 @@ async def submit_graph(body: SubmitBody) -> SubmitResp:
     unique_models = sorted({job.model_of(n) for n in job.nodes})
     for mid in unique_models:
         if mid not in scheduler.models:
-            try:
-                await ensure_model(scheduler, mid, gpu_snapshot, MODEL_CARD_PATH)
-            except Exception as e:
-                raise HTTPException(status_code=400, detail=str(e))
+            await ensure_model(scheduler, mid, gpu_snapshot, MODEL_CARD_PATH, alpha=ALPHA)
 
     jobs[job_id] = job
 
