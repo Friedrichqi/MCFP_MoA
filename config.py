@@ -11,7 +11,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from entities import ModelCard
+from .entities import ModelCard
 
 
 @dataclass
@@ -43,7 +43,7 @@ class SchedulerConfig:
     model_card_path: str = "model_card.json"
     
     # Scheduler limits
-    max_decisions_per_step: int = 256
+    max_decisions_per_step: int = 1024
     timing_ema_alpha: float = 0.2
     
     # Server settings
@@ -88,7 +88,7 @@ class SchedulerConfig:
             vllm_request_timeout_s=get_float("VLLM_REQUEST_TIMEOUT_S", 300.0),
             vllm_extra_args=get_list("VLLM_EXTRA_ARGS", []),
             model_card_path=get_str("MODEL_CARD_PATH", "model_card.json"),
-            max_decisions_per_step=get_int("MAX_DECISIONS_PER_STEP", 256),
+            max_decisions_per_step=get_int("MAX_DECISIONS_PER_STEP", 1024),
             timing_ema_alpha=get_float("TIMING_EMA_ALPHA", 0.2),
             server_host=get_str("SERVER_HOST", "0.0.0.0"),
             server_port=get_int("SERVER_PORT", 8000),

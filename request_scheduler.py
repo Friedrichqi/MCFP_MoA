@@ -65,7 +65,7 @@ class RequestScheduler:
         model_cards: Dict[str, ModelCard],
         *,
         beta: float = 1.0,
-        max_decisions_per_step: int = 256,
+        max_decisions_per_step: int = 1024,
     ) -> None:
         self.controller = controller
         self.instances = instances

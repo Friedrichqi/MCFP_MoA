@@ -56,7 +56,6 @@ class MCFAssignment:
     """A GPU-to-model assignment from the MCF solution."""
     gpu_id: int
     model_id: str
-    action: str  # "load", "wake", "keep", "noop"
     cost: float
 
 
@@ -378,13 +377,9 @@ class MinCostFlowSolver:
                 gpu_id = gpu_ids[i]
                 model_id = model_ids[j]
                 
-                # Determine action (simplified)
-                action = "load"  # Default to load
-                
                 assignments.append(MCFAssignment(
                     gpu_id=gpu_id,
                     model_id=model_id,
-                    action=action,
                     cost=cost,
                 ))
                 total_cost += cost
@@ -426,7 +421,6 @@ class MinCostFlowSolver:
             assignments.append(MCFAssignment(
                 gpu_id=gpu_id,
                 model_id=model_id,
-                action="load",
                 cost=cost,
             ))
             total_cost += cost

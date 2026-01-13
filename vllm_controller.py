@@ -561,69 +561,69 @@ class ManagedVLLMController:
             await asyncio.sleep(poll_s)
 
 
-# -----------------------------
-# Mock Controller for Testing
-# -----------------------------
+# # -----------------------------
+# # Mock Controller for Testing
+# # -----------------------------
 
-class MockVLLMController:
-    """Mock controller for testing without real vLLM servers."""
+# class MockVLLMController:
+#     """Mock controller for testing without real vLLM servers."""
     
-    def __init__(self):
-        self._instances: Dict[str, Instance] = {}
-        self._next_id = 0
+#     def __init__(self):
+#         self._instances: Dict[str, Instance] = {}
+#         self._next_id = 0
     
-    async def metrics(self, inst: Instance) -> DrainLatency:
-        return DrainLatency(num_requests=0, latency_sum=0, latency_count=1)
+#     async def metrics(self, inst: Instance) -> DrainLatency:
+#         return DrainLatency(num_requests=0, latency_sum=0, latency_count=1)
     
-    async def pid_used_MB(self) -> Dict[Tuple[int, int], int]:
-        return {}
+#     async def pid_used_MB(self) -> Dict[Tuple[int, int], int]:
+#         return {}
     
-    async def start(
-        self,
-        model: str,
-        gpu_set: Tuple[int, ...],
-        tp: int,
-        gpu_mem_util: float = 0.9,
-    ) -> Instance:
-        self._next_id += 1
-        instance_id = f"mock_{self._next_id}"
-        inst = Instance(
-            instance_id=instance_id,
-            model_id=model,
-            gpus=tuple(gpu_set),
-            base_url=f"http://mock:{8000 + self._next_id}",
-            metrics_url=f"http://mock:{8000 + self._next_id}/metrics",
-            state=InstState.ACTIVE,
-            pid_by_gpu={g: 1000 + g for g in gpu_set},
-        )
-        self._instances[instance_id] = inst
-        await asyncio.sleep(0.01)  # Simulate startup
-        return inst
+#     async def start(
+#         self,
+#         model: str,
+#         gpu_set: Tuple[int, ...],
+#         tp: int,
+#         gpu_mem_util: float = 0.9,
+#     ) -> Instance:
+#         self._next_id += 1
+#         instance_id = f"mock_{self._next_id}"
+#         inst = Instance(
+#             instance_id=instance_id,
+#             model_id=model,
+#             gpus=tuple(gpu_set),
+#             base_url=f"http://mock:{8000 + self._next_id}",
+#             metrics_url=f"http://mock:{8000 + self._next_id}/metrics",
+#             state=InstState.ACTIVE,
+#             pid_by_gpu={g: 1000 + g for g in gpu_set},
+#         )
+#         self._instances[instance_id] = inst
+#         await asyncio.sleep(0.01)  # Simulate startup
+#         return inst
     
-    async def sleep(self, inst: Instance) -> float:
-        inst.state = InstState.SLEPT
-        await asyncio.sleep(0.01)
-        return 0.01
+#     async def sleep(self, inst: Instance) -> float:
+#         inst.state = InstState.SLEPT
+#         await asyncio.sleep(0.01)
+#         return 0.01
     
-    async def wake(self, inst: Instance) -> float:
-        inst.state = InstState.ACTIVE
-        await asyncio.sleep(0.01)
-        return 0.01
+#     async def wake(self, inst: Instance) -> float:
+#         inst.state = InstState.ACTIVE
+#         await asyncio.sleep(0.01)
+#         return 0.01
     
-    async def kill(self, inst: Instance) -> float:
-        inst.state = InstState.VANISHING
-        self._instances.pop(inst.instance_id, None)
-        await asyncio.sleep(0.01)
-        return 0.01
+#     async def kill(self, inst: Instance) -> float:
+#         inst.state = InstState.VANISHING
+#         self._instances.pop(inst.instance_id, None)
+#         await asyncio.sleep(0.01)
+#         return 0.01
     
-    async def infer(self, inst: Instance, payload: Any) -> Any:
-        await asyncio.sleep(0.01)
-        return {"choices": [{"message": {"content": "Mock response"}}]}
+#     async def infer(self, inst: Instance, payload: Any) -> Any:
+#         await asyncio.sleep(0.01)
+#         return {"choices": [{"message": {"content": "Mock response"}}]}
     
-    async def drain_until_empty(
-        self,
-        inst: Instance,
-        poll_s: float = 0.2,
-        timeout_s: float = 600.0,
-    ) -> float:
-        return 0.0
+#     async def drain_until_empty(
+#         self,
+#         inst: Instance,
+#         poll_s: float = 0.2,
+#         timeout_s: float = 600.0,
+#     ) -> float:
+#         return 0.0
