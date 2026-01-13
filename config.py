@@ -11,7 +11,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from .entities import ModelCard
+from entities import ModelCard
 
 
 @dataclass

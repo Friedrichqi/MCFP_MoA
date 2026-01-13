@@ -30,14 +30,14 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 # Local imports
-from .entities import (
+from entities import (
     GPUInfo, GPUState, ModelCard, Instance, InstState,
     Request, ReqState, DrainLatency, Residence
 )
-from .config import SchedulerConfig, read_model_cards, write_model_cards, ensure_model_card
-from .vllm_controller import ManagedVLLMController
-from .request_scheduler import RequestScheduler, JobGraph
-from .gpu_scheduler import GPUScheduler
+from config import SchedulerConfig, read_model_cards, write_model_cards, ensure_model_card
+from vllm_controller import ManagedVLLMController
+from request_scheduler import RequestScheduler, JobGraph
+from gpu_scheduler import GPUScheduler
 
 
 # -----------------------------
