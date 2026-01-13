@@ -266,7 +266,7 @@ class GPUScheduler:
                 plan.to_wake.append(slept_inst.instance_id)
             else:
                 # Need to load new instance
-                gpu_set = self._find_gpu_set_for_model(model_id)
+                gpu_set = self._find_gpu_set_for_model(model_id, gpu_id)
                 if gpu_set:
                     plan.to_load.append((gpu_set, model_id))
         
@@ -302,24 +302,29 @@ class GPUScheduler:
                 return inst
         return None
     
-    def _find_gpu_set_for_model(self, model_id: str) -> Optional[Tuple[int, ...]]:
-        """Find appropriate GPU set for a model based on tp_min."""
+    def _find_gpu_set_for_model(self, model_id: str, assigned_gpu: int) -> Optional[Tuple[int, ...]]:
+        """Find GPU set containing the assigned GPU for a model.
+        
+        Args:
+            model_id: The model to find a GPU set for
+            assigned_gpu: The GPU ID assigned by MCF solver
+            
+        Returns:
+            GPU set tuple containing the assigned GPU, or None if not found
+        """
         card = self.model_cards.get(model_id)
-        if not card:
-            # Default to single GPU
-            for gpu in self.gpus.values():
-                if gpu.is_stable:
-                    return (gpu.gpu_id,)
-            return None
+        tp_min = card.tp_min if card else 1
         
-        tp_min = card.tp_min
-        
-        # Find smallest GPU set that meets tp_min
+        # Find GPU set containing the assigned GPU that meets tp_min
         for gpu_set in sorted(self.gpu_sets, key=len):
-            if len(gpu_set) >= tp_min:
+            if assigned_gpu in gpu_set and len(gpu_set) >= tp_min:
                 # Check if all GPUs are stable
                 if all(self.gpus[g].is_stable for g in gpu_set if g in self.gpus):
                     return gpu_set
+        
+        # Fallback: return single GPU set if tp_min=1
+        if tp_min == 1 and assigned_gpu in self.gpus and self.gpus[assigned_gpu].is_stable:
+            return (assigned_gpu,)
         
         return None
     
@@ -364,21 +369,20 @@ class GPUScheduler:
         """Execute the reconfiguration plan."""
         now = time.monotonic()
         
-        # 1. Sleep instances
-        for inst_id in plan.to_sleep:
-            await self._sleep_instance(inst_id)
+        # 1. Sleep instances (can be parallelized too if desired)
+        await asyncio.gather(*[self._sleep_instance(inst_id) for inst_id in plan.to_sleep])
         
         # 2. Offload instances
-        for inst_id in plan.to_offload:
-            await self._offload_instance(inst_id)
+        await asyncio.gather(*[self._offload_instance(inst_id) for inst_id in plan.to_offload])
         
         # 3. Wake instances
-        for inst_id in plan.to_wake:
-            await self._wake_instance(inst_id)
+        await asyncio.gather(*[self._wake_instance(inst_id) for inst_id in plan.to_wake])
         
-        # 4. Load new instances
-        for gpu_set, model_id in plan.to_load:
-            await self._load_instance(gpu_set, model_id)
+        # 4. Load new instances - RUN IN PARALLEL
+        await asyncio.gather(*[
+            self._load_instance(gpu_set, model_id) 
+            for gpu_set, model_id in plan.to_load
+        ])
     
     async def _sleep_instance(self, inst_id: str) -> None:
         """Put an instance to sleep."""
@@ -396,10 +400,34 @@ class GPUScheduler:
             t0 = time.monotonic()
             elapsed = await self.controller.sleep(inst)
             
-            # Update EMA
+            # Measure GPU memory consumption after sleeping
+            # Wait a short time for memory to stabilize
+            await asyncio.sleep(0.1)
+            pid_mem = await self.controller.pid_used_MB()
+            
+            # Calculate slept memory per GPU for this instance
+            tp = len(inst.gpus)
+            slept_mem_samples = []
+            for g in inst.gpus:
+                pid = inst.pid_by_gpu.get(g)
+                if pid:
+                    mem_MB = pid_mem.get((g, pid), 0)
+                    if mem_MB > 0:
+                        slept_mem_samples.append(mem_MB)
+            
+            # Update EMA for timing
             card = self.model_cards.get(inst.model_id)
             if card:
                 card.update_sleep(elapsed, alpha=self.timing_ema_alpha)
+                
+                # Update slept memory EMA if we got valid measurements
+                if slept_mem_samples:
+                    avg_slept_mem = sum(slept_mem_samples) / len(slept_mem_samples)
+                    card.update_slept_mem(tp, avg_slept_mem, alpha=self.timing_ema_alpha)
+                    logger.info(
+                        f"Measured slept memory for {inst.model_id}: "
+                        f"{avg_slept_mem:.0f} MB per GPU (tp={tp})"
+                    )
             
             # Update state
             inst.state = InstState.SLEPT
@@ -505,11 +533,15 @@ class GPUScheduler:
         
         try:
             tp = len(gpu_set)
-            gpu_mem_util = (
-                ManagedVLLMController.compute_gpu_mem_util(gpu_set)
-                if isinstance(self.controller, ManagedVLLMController)
-                else 0.9
-            )
+            gpu_mem_util = min([
+                (1 - self.gpus[g].alpha)
+                for g in gpu_set
+            ])
+            # gpu_mem_util = (
+            #     ManagedVLLMController.compute_gpu_mem_util(gpu_set)
+            #     if isinstance(self.controller, ManagedVLLMController)
+            #     else 0.9
+            # )
             
             t0 = time.monotonic()
             inst = await self.controller.start(model_id, gpu_set, tp, gpu_mem_util)

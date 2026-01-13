@@ -322,6 +322,16 @@ class RequestScheduler:
         # Update instance last_used
         inst.last_used = now
         
+        # Call on_dispatched callback and add successor requests
+        if req.on_dispatched:
+            try:
+                new_requests = req.on_dispatched(req)
+                if new_requests:
+                    for new_req in new_requests:
+                        self._add_request_locked(new_req)
+            except Exception as e:
+                logger.error(f"on_dispatched callback failed for {req.key}: {e}")
+        
         # Spawn background task for inference
         self._spawn_task(self._run_inference(req, inst))
         self._stats.total_requests_dispatched += 1
@@ -338,10 +348,18 @@ class RequestScheduler:
             logger.error(f"Inference failed for {req.key}: {e}")
             result = {"error": str(e), "instance_id": inst.instance_id}
         
-        # Mark as done
+        # Mark as done and decrement successor indegrees
         async with self._lock:
             req.state = ReqState.DONE
             self._stats.total_requests_completed += 1
+            
+            # Decrement indegree of all successors
+            for succ_node in req.succ:
+                succ_key = f"{req.job_id}:{succ_node}"
+                if succ_key in self._requests:
+                    self._requests[succ_key].indegree = max(
+                        0, self._requests[succ_key].indegree - 1
+                    )
         
         # Call completion callback
         if req.on_completed:
