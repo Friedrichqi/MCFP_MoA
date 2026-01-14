@@ -342,6 +342,17 @@ class RequestScheduler:
     
     async def _run_inference(self, req: Request, inst: Instance) -> None:
         """Execute inference for a request."""
+        # Pre-flight check: instance may have been slept between dispatch and execution
+        if not inst.accept_new:
+            logger.warning(
+                f"Instance {inst.instance_id} is no longer active (state={inst.state}), "
+                f"re-queueing request {req.key}"
+            )
+            async with self._lock:
+                req.state = ReqState.WAITING
+                self._push_heap(self._waiting, req.t_arr, req.key)
+            return
+        
         try:
             result = await self.controller.infer(inst, req.payload)
         except Exception as e:

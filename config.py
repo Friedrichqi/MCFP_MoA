@@ -29,7 +29,7 @@ class SchedulerConfig:
     delta_t2: float = 5.0   # GPU reconfiguration (seconds)
     
     # GPU settings
-    alpha: float = 0.4      # Max VRAM fraction for slept weights
+    alpha: float = 0.2      # Max VRAM fraction for slept weights
     beta: float = 1.0       # Wait cost multiplier
     
     # vLLM settings
@@ -80,7 +80,7 @@ class SchedulerConfig:
         return cls(
             delta_t1=get_float("DELTA_T1", 1.0),
             delta_t2=get_float("DELTA_T2", 5.0),
-            alpha=get_float("ALPHA", 0.4),
+            alpha=get_float("ALPHA", 0.2),
             beta=get_float("BETA", 1.0),
             vllm_host=get_str("VLLM_HOST", "127.0.0.1"),
             vllm_port_base=get_int("VLLM_PORT_BASE", 9000),
@@ -112,8 +112,7 @@ def read_model_cards(path: str) -> Dict[str, ModelCard]:
             "t_load_s": 90.0,
             "t_offload_s": 3.0,
             "slept_mem_tp1_MB": 2048.0,
-            "slept_mem_tpgt1_MB": 4096.0,
-            "avg_service_s": 0.2
+            "slept_mem_tpgt1_MB": 4096.0
         },
         ...
     }
@@ -168,7 +167,6 @@ def ensure_model_card(
         t_offload_s=3.0,
         slept_mem_tp1_MB=2048.0,
         slept_mem_tpgt1_MB=4096.0,
-        avg_service_s=0.2,
     )
     cards[model_id] = card
     
