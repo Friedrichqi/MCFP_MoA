@@ -427,6 +427,7 @@ class ManagedVLLMController:
             "--port", str(port),
             "--tensor-parallel-size", str(tp),
             "--enable-sleep-mode",
+            "--max-model-len", "16384",
             "--gpu-memory-utilization", str(gpu_mem_util),
         ] + self.vllm_extra_args
         
@@ -551,6 +552,7 @@ class ManagedVLLMController:
         timeout_s: float = 600.0,
     ) -> float:
         """Wait until instance has no pending requests."""
+        inst.accept_new = False
         t0 = time.monotonic()
         while True:
             snap = await self.metrics(inst)

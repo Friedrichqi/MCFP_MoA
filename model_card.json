@@ -2,12 +2,11 @@
   "Qwen/Qwen3-8B": {
     "tp_min": 1,
     "t_wake_s": 1.6133843949995936,
-    "t_sleep_s": 1.6658658449538053,
+    "t_sleep_s": 1.3941832632012667,
     "t_load_s": 98.13254464161398,
     "t_offload_s": 3.0,
-    "slept_mem_tp1_MB": 2048.0,
-    "slept_mem_tpgt1_MB": 4096.0,
-    "avg_service_s": 0.2
+    "slept_mem_tp1_MB": 1825.6000000000001,
+    "slept_mem_tpgt1_MB": 4096.0
   },
   "Qwen/Qwen3-4B": {
     "tp_min": 1,
@@ -16,38 +15,34 @@
     "t_load_s": 81.5588295794569,
     "t_offload_s": 3.0,
     "slept_mem_tp1_MB": 1827.6000000000001,
-    "slept_mem_tpgt1_MB": 4096.0,
-    "avg_service_s": 0.2
+    "slept_mem_tpgt1_MB": 4096.0
   },
   "Qwen/Qwen3-0.6B": {
     "tp_min": 1,
     "t_wake_s": 1.6176910849288106,
-    "t_sleep_s": 1.632748076878488,
+    "t_sleep_s": 1.3448065330833199,
     "t_load_s": 69.86554265205741,
     "t_offload_s": 3.0,
-    "slept_mem_tp1_MB": 2048.0,
-    "slept_mem_tpgt1_MB": 4096.0,
-    "avg_service_s": 0.2
+    "slept_mem_tp1_MB": 1805.6000000000001,
+    "slept_mem_tpgt1_MB": 4096.0
   },
   "meta-llama/Llama-3.2-3B-Instruct": {
     "tp_min": 1,
     "t_wake_s": 2.0,
-    "t_sleep_s": 1.657540122792125,
-    "t_load_s": 103.99423125293106,
+    "t_sleep_s": 8.20931733980775,
+    "t_load_s": 95.4737266171463,
     "t_offload_s": 3.0,
     "slept_mem_tp1_MB": 2048.0,
-    "slept_mem_tpgt1_MB": 4096.0,
-    "avg_service_s": 0.2
+    "slept_mem_tpgt1_MB": 4096.0
   },
   "meta-llama/Llama-3.1-8B-Instruct": {
     "tp_min": 1,
     "t_wake_s": 2.0,
-    "t_sleep_s": 2.0,
-    "t_load_s": 90.0,
+    "t_sleep_s": 1.9495859979651868,
+    "t_load_s": 84.57824732603507,
     "t_offload_s": 3.0,
-    "slept_mem_tp1_MB": 2048.0,
-    "slept_mem_tpgt1_MB": 4096.0,
-    "avg_service_s": 0.2
+    "slept_mem_tp1_MB": 2056.0,
+    "slept_mem_tpgt1_MB": 4096.0
   },
   "meta-llama/Llama-3.2-1B-Instruct": {
     "tp_min": 1,
@@ -56,28 +51,25 @@
     "t_load_s": 98.03649124959483,
     "t_offload_s": 3.0,
     "slept_mem_tp1_MB": 2048.0,
-    "slept_mem_tpgt1_MB": 4096.0,
-    "avg_service_s": 0.2
+    "slept_mem_tpgt1_MB": 4096.0
   },
   "Qwen/Qwen3-4B-Instruct-2507": {
     "tp_min": 1,
     "t_wake_s": 2.0,
     "t_sleep_s": 2.0,
-    "t_load_s": 90.0,
+    "t_load_s": 97.23621098950133,
     "t_offload_s": 3.0,
     "slept_mem_tp1_MB": 2048.0,
-    "slept_mem_tpgt1_MB": 4096.0,
-    "avg_service_s": 0.2
+    "slept_mem_tpgt1_MB": 4096.0
   },
   "Qwen/Qwen2.5-3B": {
     "tp_min": 1,
     "t_wake_s": 2.0,
     "t_sleep_s": 2.0,
-    "t_load_s": 90.0,
+    "t_load_s": 86.0791889877522,
     "t_offload_s": 3.0,
     "slept_mem_tp1_MB": 2048.0,
-    "slept_mem_tpgt1_MB": 4096.0,
-    "avg_service_s": 0.2
+    "slept_mem_tpgt1_MB": 4096.0
   },
   "Qwen/Qwen2.5-4B": {
     "tp_min": 1,
@@ -86,17 +78,15 @@
     "t_load_s": 90.0,
     "t_offload_s": 3.0,
     "slept_mem_tp1_MB": 2048.0,
-    "slept_mem_tpgt1_MB": 4096.0,
-    "avg_service_s": 0.2
+    "slept_mem_tpgt1_MB": 4096.0
   },
   "Qwen/Qwen2.5-7B": {
     "tp_min": 1,
     "t_wake_s": 2.0,
-    "t_sleep_s": 2.0,
-    "t_load_s": 90.0,
+    "t_sleep_s": 3.072462620213628,
+    "t_load_s": 80.57834023119808,
     "t_offload_s": 3.0,
-    "slept_mem_tp1_MB": 2048.0,
-    "slept_mem_tpgt1_MB": 4096.0,
-    "avg_service_s": 0.2
+    "slept_mem_tp1_MB": 1815.2,
+    "slept_mem_tpgt1_MB": 4096.0
   }
 }

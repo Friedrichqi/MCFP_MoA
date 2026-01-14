@@ -82,9 +82,6 @@ class ModelCard:
     slept_mem_tp1_MB: float = 2048.0
     slept_mem_tpgt1_MB: float = 4096.0
     
-    # Average service time
-    avg_service_s: float = 0.2
-    
     def slept_mem_MB(self, tp: int) -> float:
         """Get slept memory footprint based on tensor-parallel degree."""
         return self.slept_mem_tp1_MB if tp <= 1 else self.slept_mem_tpgt1_MB
@@ -123,7 +120,6 @@ class ModelCard:
             "t_offload_s": self.t_offload_s,
             "slept_mem_tp1_MB": self.slept_mem_tp1_MB,
             "slept_mem_tpgt1_MB": self.slept_mem_tpgt1_MB,
-            "avg_service_s": self.avg_service_s,
         }
     
     @classmethod
@@ -138,7 +134,6 @@ class ModelCard:
             t_offload_s=float(data.get("t_offload_s", 3.0)),
             slept_mem_tp1_MB=float(data.get("slept_mem_tp1_MB", data.get("slept_mem_MB_tp1", 2048.0))),
             slept_mem_tpgt1_MB=float(data.get("slept_mem_tpgt1_MB", data.get("slept_mem_MB_tpgt1", 4096.0))),
-            avg_service_s=float(data.get("avg_service_s", 0.2)),
         )
 
 

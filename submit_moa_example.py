@@ -20,6 +20,8 @@ def submit_job():
         "graph": {
             "layer1_fast": ["layer2_aggregator"],
             "layer1_thoughtful": ["layer2_aggregator"],
+            "layer1_add1": ["layer2_aggregator"],
+            "layer1_add2": ["layer2_aggregator"],
             "layer2_aggregator": []
         },
         
@@ -27,6 +29,8 @@ def submit_job():
         "node_models": {
             "layer1_fast": "Qwen/Qwen2.5-3B",
             "layer1_thoughtful": "Qwen/Qwen2.5-7B",
+            "layer1_add1": "meta-llama/Llama-3.1-8B-Instruct",
+            "layer1_add2": "meta-llama/Llama-3.2-3B-Instruct",
             "layer2_aggregator": "Qwen/Qwen3-4B-Instruct-2507"
         },
         
@@ -34,12 +38,16 @@ def submit_job():
         "inputs": {
             "layer1_fast": {
                 "messages": [{"role": "user", "content": "Explain quantum entanglement briefly."}],
-                "temperature": 0.7
             },
             "layer1_thoughtful": {
                 "messages": [{"role": "user", "content": "Explain quantum entanglement in detail."}],
-                "temperature": 0.3
-            }
+            },
+            "layer1_add1": {
+                "messages": [{"role": "user", "content": "Explain quantum entanglement in detail."}]
+            },
+            "layer1_add2": {
+                "messages": [{"role": "user", "content": "Explain quantum entanglement in detail."}]
+            },
             # layer2_aggregator receives inputs automatically from parents
         }
     }
@@ -61,4 +69,5 @@ def submit_job():
              print(f"Server response: {e.response.text}")
 
 if __name__ == "__main__":
-    submit_job()
+    for _ in range(512):
+        submit_job()

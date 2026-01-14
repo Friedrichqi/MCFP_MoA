@@ -431,7 +431,6 @@ class GPUScheduler:
             
             # Update state
             inst.state = InstState.SLEPT
-            inst.accept_new = False
             self.active_ids.discard(inst_id)
             self.slept_ids.add(inst_id)
             
