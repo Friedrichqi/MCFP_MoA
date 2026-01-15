@@ -69,5 +69,5 @@ def submit_job():
              print(f"Server response: {e.response.text}")
 
 if __name__ == "__main__":
-    for _ in range(512):
+    for _ in range(128):
         submit_job()

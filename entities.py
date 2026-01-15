@@ -315,7 +315,8 @@ class DrainLatency:
     """
     Metrics snapshot from vLLM for computing drain latency.
     
-    drain_latency = (num_requests * latency_sum) / latency_count
+    Uses p95 latency as drain estimate since requests are processed
+    concurrently in batches, not sequentially.
     
     This is used both for:
     - Immediate routing decisions
@@ -325,6 +326,9 @@ class DrainLatency:
     num_requests: float = 0.0
     latency_sum: float = 0.0
     latency_count: float = 0.0
+    # Histogram buckets: list of (le_bound, cumulative_count)
+    # Sorted by le_bound ascending, with +inf as the last entry
+    latency_buckets: List[Tuple[float, float]] = field(default_factory=list)
     
     @property
     def avg_latency(self) -> float:
@@ -333,16 +337,63 @@ class DrainLatency:
             return self.latency_sum / self.latency_count
         return 0.0
     
+    def percentile_latency(self, p: float = 0.95) -> float:
+        """
+        Estimate percentile latency from histogram buckets.
+        
+        Uses linear interpolation within the bucket containing the percentile.
+        Falls back to avg_latency if buckets are not available.
+        
+        Args:
+            p: Percentile as fraction (0.95 = 95th percentile)
+        """
+        if not self.latency_buckets or self.latency_count <= 0:
+            return self.avg_latency
+        
+        target_count = p * self.latency_count
+        
+        # Find the bucket containing the target percentile
+        prev_bound = 0.0
+        prev_count = 0.0
+        
+        for le_bound, cum_count in self.latency_buckets:
+            if cum_count >= target_count:
+                # Linear interpolation within this bucket
+                if cum_count == prev_count:
+                    # No samples in this bucket, use upper bound
+                    return le_bound if le_bound != float('inf') else prev_bound
+                
+                # Fraction within this bucket
+                frac = (target_count - prev_count) / (cum_count - prev_count)
+                
+                if le_bound == float('inf'):
+                    # Last bucket is +inf, use previous bound + some margin
+                    return prev_bound * 1.5 if prev_bound > 0 else self.avg_latency
+                
+                return prev_bound + frac * (le_bound - prev_bound)
+            
+            prev_bound = le_bound
+            prev_count = cum_count
+        
+        # All samples are beyond the last finite bucket
+        return self.avg_latency
+    
+    @property
+    def p95_latency(self) -> float:
+        """95th percentile latency."""
+        return self.percentile_latency(0.95)
+    
     @property
     def drain_latency(self) -> float:
         """
         Estimated time to drain current queue.
         
-        Formula: (num_requests * latency_sum) / latency_count
+        Uses p95 latency since requests are processed concurrently.
+        This represents how long until the slowest request finishes.
         """
-        if self.latency_count > 0:
-            return (self.num_requests * self.latency_sum) / self.latency_count
-        return 0.0
+        if self.num_requests <= 0:
+            return 0.0
+        return self.p95_latency
     
     @property
     def backlog_cost(self) -> float:

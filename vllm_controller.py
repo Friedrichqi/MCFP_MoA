@@ -99,7 +99,7 @@ class ManagedVLLMController:
     Wake: POST {base_url}/wake_up
     
     Metrics parsing:
-        vllm:num_requests
+        vllm:num_requests_running + vllm:num_requests_waiting
         vllm:e2e_request_latency_seconds_(sum|count)
     """
     
@@ -207,9 +207,11 @@ class ManagedVLLMController:
             return DrainLatency()
         
         targets = {
-            "vllm:num_requests",
+            "vllm:num_requests_running",
+            "vllm:num_requests_waiting",
             "vllm:e2e_request_latency_seconds_sum",
             "vllm:e2e_request_latency_seconds_count",
+            "vllm:e2e_request_latency_seconds_bucket",
         }
         
         samples: Dict[str, List[Tuple[Dict[str, str], float]]] = {k: [] for k in targets}
@@ -237,10 +239,41 @@ class ManagedVLLMController:
                     return float(v)
             return float(arr[0][1])
         
+        def pick_buckets() -> List[Tuple[float, float]]:
+            """Extract histogram buckets as (le_bound, cumulative_count) pairs."""
+            arr = samples.get("vllm:e2e_request_latency_seconds_bucket", [])
+            if not arr:
+                return []
+            
+            # Filter by model_name if possible
+            model_buckets = [(labels, v) for labels, v in arr 
+                             if labels.get("model_name") == inst.model_id]
+            if not model_buckets:
+                model_buckets = arr
+            
+            # Extract (le, count) pairs and sort by le
+            buckets: List[Tuple[float, float]] = []
+            for labels, count in model_buckets:
+                le_str = labels.get("le", "")
+                if le_str == "+Inf":
+                    le_val = float('inf')
+                else:
+                    try:
+                        le_val = float(le_str)
+                    except ValueError:
+                        continue
+                buckets.append((le_val, float(count)))
+            
+            # Sort by le bound
+            buckets.sort(key=lambda x: (x[0] == float('inf'), x[0]))
+            return buckets
+        
+        num_requests = pick("vllm:num_requests_running") + pick("vllm:num_requests_waiting")
         return DrainLatency(
-            num_requests=pick("vllm:num_requests"),
+            num_requests=num_requests,
             latency_sum=pick("vllm:e2e_request_latency_seconds_sum"),
             latency_count=pick("vllm:e2e_request_latency_seconds_count"),
+            latency_buckets=pick_buckets(),
         )
     
     # ---------- nvidia-smi Helpers ----------
@@ -561,71 +594,3 @@ class ManagedVLLMController:
             if time.monotonic() - t0 > timeout_s:
                 return time.monotonic() - t0
             await asyncio.sleep(poll_s)
-
-
-# # -----------------------------
-# # Mock Controller for Testing
-# # -----------------------------
-
-# class MockVLLMController:
-#     """Mock controller for testing without real vLLM servers."""
-    
-#     def __init__(self):
-#         self._instances: Dict[str, Instance] = {}
-#         self._next_id = 0
-    
-#     async def metrics(self, inst: Instance) -> DrainLatency:
-#         return DrainLatency(num_requests=0, latency_sum=0, latency_count=1)
-    
-#     async def pid_used_MB(self) -> Dict[Tuple[int, int], int]:
-#         return {}
-    
-#     async def start(
-#         self,
-#         model: str,
-#         gpu_set: Tuple[int, ...],
-#         tp: int,
-#         gpu_mem_util: float = 0.9,
-#     ) -> Instance:
-#         self._next_id += 1
-#         instance_id = f"mock_{self._next_id}"
-#         inst = Instance(
-#             instance_id=instance_id,
-#             model_id=model,
-#             gpus=tuple(gpu_set),
-#             base_url=f"http://mock:{8000 + self._next_id}",
-#             metrics_url=f"http://mock:{8000 + self._next_id}/metrics",
-#             state=InstState.ACTIVE,
-#             pid_by_gpu={g: 1000 + g for g in gpu_set},
-#         )
-#         self._instances[instance_id] = inst
-#         await asyncio.sleep(0.01)  # Simulate startup
-#         return inst
-    
-#     async def sleep(self, inst: Instance) -> float:
-#         inst.state = InstState.SLEPT
-#         await asyncio.sleep(0.01)
-#         return 0.01
-    
-#     async def wake(self, inst: Instance) -> float:
-#         inst.state = InstState.ACTIVE
-#         await asyncio.sleep(0.01)
-#         return 0.01
-    
-#     async def kill(self, inst: Instance) -> float:
-#         inst.state = InstState.VANISHING
-#         self._instances.pop(inst.instance_id, None)
-#         await asyncio.sleep(0.01)
-#         return 0.01
-    
-#     async def infer(self, inst: Instance, payload: Any) -> Any:
-#         await asyncio.sleep(0.01)
-#         return {"choices": [{"message": {"content": "Mock response"}}]}
-    
-#     async def drain_until_empty(
-#         self,
-#         inst: Instance,
-#         poll_s: float = 0.2,
-#         timeout_s: float = 600.0,
-#     ) -> float:
-#         return 0.0
