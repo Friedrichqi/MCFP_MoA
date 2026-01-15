@@ -342,8 +342,8 @@ class RequestScheduler:
     
     async def _run_inference(self, req: Request, inst: Instance) -> None:
         """Execute inference for a request."""
-        # Pre-flight check: instance may have been slept between dispatch and execution
-        if not inst.accept_new:
+        # Sanity check: instance may have been slept between dispatch and execution
+        if inst.state != InstState.ACTIVE:
             logger.warning(
                 f"Instance {inst.instance_id} is no longer active (state={inst.state}), "
                 f"re-queueing request {req.key}"

@@ -394,7 +394,7 @@ class GPUScheduler:
         
         try:
             # Drain first
-            await self.controller.drain_until_empty(inst, timeout_s=60.0)
+            await self.controller.drain_until_empty(inst, timeout_s=600.0)
             
             # Sleep
             t0 = time.monotonic()
