@@ -132,9 +132,8 @@ class GPUScheduler:
             metrics = await self._fetch_all_metrics()
             
             # 3. Compute derived values
-            all_requests = potential_requests + waiting_requests
-            waiting_times = compute_waiting_times(all_requests, now)
-            request_counts = compute_request_counts(all_requests)
+            waiting_times = compute_waiting_times(waiting_requests, now)
+            request_counts = compute_request_counts(potential_requests + waiting_requests)
             drain_latencies = compute_drain_latencies(
                 self.gpus, self.instances, metrics
             )

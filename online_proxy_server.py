@@ -503,12 +503,13 @@ async def register_instance(body: RegisterInstanceBody) -> Dict[str, Any]:
 
 
 @app.get("/instances")
-async def list_instances() -> Dict[str, Any]:
-    """List all known vLLM instances."""
+async def list_instances() -> List[Dict[str, Any]]:
+    """List all known vLLM instances, sorted by GPUs."""
     if controller is None:
         raise HTTPException(status_code=503, detail="Controller not ready")
     
-    inst_list = list(instances.values())
+    # Sort instances by GPU IDs
+    inst_list = sorted(instances.values(), key=lambda i: i.gpus)
     
     # Fetch metrics
     metrics = await asyncio.gather(
@@ -535,7 +536,7 @@ async def list_instances() -> Dict[str, Any]:
         
         result.append(entry)
     
-    return {"instances": result}
+    return result
 
 
 @app.get("/model_stats")
