@@ -412,6 +412,12 @@ class GPUScheduler:
             # Drain first
             await self.controller.drain_until_empty(inst, timeout_s=600.0)
             
+            # Update state
+            inst.state = InstState.SLEPT
+            self.active_ids.discard(inst_id)
+            self.slept_ids.add(inst_id)
+            self._state.total_sleeps += 1
+
             # Sleep
             t0 = time.monotonic()
             elapsed = await self.controller.sleep(inst)
@@ -445,11 +451,6 @@ class GPUScheduler:
                         f"{avg_slept_mem:.0f} MB per GPU (tp={tp})"
                     )
             
-            # Update state
-            inst.state = InstState.SLEPT
-            self.active_ids.discard(inst_id)
-            self.slept_ids.add(inst_id)
-            
             # Update GPU state
             now = time.monotonic()
             for g in inst.gpus:
@@ -459,8 +460,6 @@ class GPUScheduler:
                     tp=len(inst.gpus),
                     url=inst.base_url
                 )
-            
-            self._state.total_sleeps += 1
             
         except Exception as e:
             logger.error(f"Failed to sleep instance {inst_id}: {e}")
@@ -474,6 +473,13 @@ class GPUScheduler:
         logger.info(f"Offloading instance {inst_id} ({inst.model_id})")
         
         try:
+            # Update state
+            inst.state = InstState.VANISHING
+            self.active_ids.discard(inst_id)
+            self.slept_ids.discard(inst_id)
+            self.instances.pop(inst_id, None)
+            self._state.total_offloads += 1
+
             t0 = time.monotonic()
             elapsed = await self.controller.kill(inst)
             
@@ -482,17 +488,10 @@ class GPUScheduler:
             if card:
                 card.update_offload(elapsed, alpha=self.timing_ema_alpha)
             
-            # Update state
-            inst.state = InstState.VANISHING
-            self.active_ids.discard(inst_id)
-            self.slept_ids.discard(inst_id)
-            self.instances.pop(inst_id, None)
-            
             # Update GPU state
             for g in inst.gpus:
                 self.gpus[g].evict_model(inst.model_id)
             
-            self._state.total_offloads += 1
             
         except Exception as e:
             logger.error(f"Failed to offload instance {inst_id}: {e}")
@@ -519,6 +518,7 @@ class GPUScheduler:
             inst.accept_new = True
             self.slept_ids.discard(inst_id)
             self.active_ids.add(inst_id)
+            self._state.total_wakes += 1
             
             # Update GPU state
             now = time.monotonic()
@@ -530,7 +530,6 @@ class GPUScheduler:
                     url=inst.base_url
                 )
             
-            self._state.total_wakes += 1
             
         except Exception as e:
             logger.error(f"Failed to wake instance {inst_id}: {e}")
@@ -552,11 +551,6 @@ class GPUScheduler:
                 (1 - self.gpus[g].alpha)
                 for g in gpu_set
             ])
-            # gpu_mem_util = (
-            #     ManagedVLLMController.compute_gpu_mem_util(gpu_set)
-            #     if isinstance(self.controller, ManagedVLLMController)
-            #     else 0.9
-            # )
             
             t0 = time.monotonic()
             inst = await self.controller.start(model_id, gpu_set, tp, gpu_mem_util)
@@ -570,6 +564,7 @@ class GPUScheduler:
             # Register instance
             self.instances[inst.instance_id] = inst
             self.active_ids.add(inst.instance_id)
+            self._state.total_loads += 1
             
             # Update GPU state
             now = time.monotonic()
@@ -580,8 +575,6 @@ class GPUScheduler:
                     tp=len(inst.gpus),
                     url=inst.base_url
                 )
-            
-            self._state.total_loads += 1
             
         except Exception as e:
             logger.error(f"Failed to load instance for {model_id}: {e}")
