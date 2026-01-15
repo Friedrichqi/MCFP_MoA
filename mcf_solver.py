@@ -291,7 +291,7 @@ class MinCostFlowSolver:
         else:
             activation_cost = model_card.t_load_s
         
-        # Waiting relief = sum of (now - t_arr) for requests needing this model
+        # Waiting relief = max(now - t_arr) for requests needing this model
         waiting_relief = waiting_times.get(model_id, 0.0)
         
         # Edge cost (can be negative, which is good - we want to maximize relief)
@@ -445,7 +445,7 @@ def compute_waiting_times(
     for req in requests:
         model = req.model
         wait = max(0.0, now - req.t_arr)
-        waiting[model] = waiting.get(model, 0.0) + wait
+        waiting[model] = max(waiting.get(model, 0.0), wait)
     return waiting
 
 
