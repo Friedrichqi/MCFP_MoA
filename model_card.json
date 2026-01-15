@@ -30,7 +30,7 @@
     "tp_min": 1,
     "t_wake_s": 2.0,
     "t_sleep_s": 6.6504640674464195,
-    "t_load_s": 125.5009832059321,
+    "t_load_s": 127.58016591554686,
     "t_offload_s": 3.0,
     "slept_mem_tp1_MB": 1881.6000000000001,
     "slept_mem_tpgt1_MB": 4096.0
@@ -39,7 +39,7 @@
     "tp_min": 1,
     "t_wake_s": 2.0,
     "t_sleep_s": 1.6220593199730502,
-    "t_load_s": 123.08720973055459,
+    "t_load_s": 128.73660926224255,
     "t_offload_s": 3.0,
     "slept_mem_tp1_MB": 1823.2000000000003,
     "slept_mem_tpgt1_MB": 4096.0
@@ -57,18 +57,18 @@
     "tp_min": 1,
     "t_wake_s": 2.0,
     "t_sleep_s": 2.0,
-    "t_load_s": 153.08634421672159,
+    "t_load_s": 152.83749954877757,
     "t_offload_s": 3.0,
     "slept_mem_tp1_MB": 2048.0,
     "slept_mem_tpgt1_MB": 4096.0
   },
   "Qwen/Qwen2.5-3B": {
     "tp_min": 1,
-    "t_wake_s": 2.0,
-    "t_sleep_s": 2.0,
-    "t_load_s": 122.04280968405769,
+    "t_wake_s": 1.6504205768011162,
+    "t_sleep_s": 1.3916502634386418,
+    "t_load_s": 126.67497381384662,
     "t_offload_s": 3.0,
-    "slept_mem_tp1_MB": 2048.0,
+    "slept_mem_tp1_MB": 1644.0800000000002,
     "slept_mem_tpgt1_MB": 4096.0
   },
   "Qwen/Qwen2.5-4B": {
@@ -82,11 +82,11 @@
   },
   "Qwen/Qwen2.5-7B": {
     "tp_min": 1,
-    "t_wake_s": 2.0,
-    "t_sleep_s": 1.8602043046691106,
-    "t_load_s": 119.67139493036242,
+    "t_wake_s": 1.6539283314006754,
+    "t_sleep_s": 1.3267817075077075,
+    "t_load_s": 135.22102310327136,
     "t_offload_s": 3.0,
-    "slept_mem_tp1_MB": 1376.8384,
+    "slept_mem_tp1_MB": 1199.416576,
     "slept_mem_tpgt1_MB": 4096.0
   }
 }

@@ -199,12 +199,22 @@ class ManagedVLLMController:
             return None
         return m.group(1), {}, float(m.group(2))
     
-    async def metrics(self, inst: Instance) -> DrainLatency:
-        """Get metrics from instance."""
+    async def metrics(
+        self,
+        inst: Instance,
+        fallback_latency: float = 60.0,
+    ) -> DrainLatency:
+        """Get metrics from instance.
+        
+        Args:
+            inst: The instance to get metrics from
+            fallback_latency: Fallback latency to use when no completed requests
+                exist (should be ModelCard.avg_latency_s)
+        """
         try:
             raw = await self._http_get_text(inst.metrics_url)
         except Exception:
-            return DrainLatency()
+            return DrainLatency(fallback_latency=fallback_latency)
         
         targets = {
             "vllm:num_requests_running",
@@ -274,6 +284,7 @@ class ManagedVLLMController:
             latency_sum=pick("vllm:e2e_request_latency_seconds_sum"),
             latency_count=pick("vllm:e2e_request_latency_seconds_count"),
             latency_buckets=pick_buckets(),
+            fallback_latency=fallback_latency,
         )
     
     # ---------- nvidia-smi Helpers ----------
