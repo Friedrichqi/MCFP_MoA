@@ -63,6 +63,7 @@ class ModelCard:
     - t_sleep_s: sleep an instance
     - t_load_s: start vLLM from scratch until ready
     - t_offload_s: kill instance (evict from GPU)
+    - avg_latency_s: average e2e request latency
     
     Memory footprints:
     - slept_mem_tp1_MB: memory per GPU when tp=1
@@ -77,6 +78,7 @@ class ModelCard:
     t_sleep_s: float = 2.0
     t_load_s: float = 90.0
     t_offload_s: float = 3.0
+    avg_latency_s: float = 60.0  # Default 60s as initial estimate
     
     # Memory footprints
     slept_mem_tp1_MB: float = 2048.0
@@ -103,6 +105,11 @@ class ModelCard:
     def update_offload(self, observed_s: float, alpha: float = 0.2) -> None:
         self.t_offload_s = self._ema(self.t_offload_s, observed_s, alpha)
     
+    def update_avg_latency(self, observed_s: float, alpha: float = 0.2) -> None:
+        """Update average latency EMA with observed value."""
+        if observed_s > 0:
+            self.avg_latency_s = self._ema(self.avg_latency_s, observed_s, alpha)
+    
     def update_slept_mem(self, tp: int, observed_MB: float, alpha: float = 0.2) -> None:
         observed_MB = max(1.0, observed_MB)
         if tp <= 1:
@@ -118,6 +125,7 @@ class ModelCard:
             "t_sleep_s": self.t_sleep_s,
             "t_load_s": self.t_load_s,
             "t_offload_s": self.t_offload_s,
+            "avg_latency_s": self.avg_latency_s,
             "slept_mem_tp1_MB": self.slept_mem_tp1_MB,
             "slept_mem_tpgt1_MB": self.slept_mem_tpgt1_MB,
         }
@@ -132,6 +140,7 @@ class ModelCard:
             t_sleep_s=float(data.get("t_sleep_s", 2.0)),
             t_load_s=float(data.get("t_load_s", 90.0)),
             t_offload_s=float(data.get("t_offload_s", 3.0)),
+            avg_latency_s=float(data.get("avg_latency_s", 60.0)),
             slept_mem_tp1_MB=float(data.get("slept_mem_tp1_MB", data.get("slept_mem_MB_tp1", 2048.0))),
             slept_mem_tpgt1_MB=float(data.get("slept_mem_tpgt1_MB", data.get("slept_mem_MB_tpgt1", 4096.0))),
         )
@@ -318,6 +327,9 @@ class DrainLatency:
     Uses p95 latency as drain estimate since requests are processed
     concurrently in batches, not sequentially.
     
+    When no completed requests exist (latency_count=0), falls back to
+    fallback_latency which should be set from ModelCard.avg_latency_s.
+    
     This is used both for:
     - Immediate routing decisions
     - Edge cost in GPU selection (min-cost flow)
@@ -329,13 +341,15 @@ class DrainLatency:
     # Histogram buckets: list of (le_bound, cumulative_count)
     # Sorted by le_bound ascending, with +inf as the last entry
     latency_buckets: List[Tuple[float, float]] = field(default_factory=list)
+    # Fallback latency from ModelCard when no data available
+    fallback_latency: float = 60.0
     
     @property
     def avg_latency(self) -> float:
-        """Average end-to-end latency."""
+        """Average end-to-end latency, with fallback if no data."""
         if self.latency_count > 0:
             return self.latency_sum / self.latency_count
-        return 0.0
+        return self.fallback_latency
     
     def percentile_latency(self, p: float = 0.95) -> float:
         """

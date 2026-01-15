@@ -198,8 +198,17 @@ class GPUScheduler:
         if not active_insts:
             return {}
         
+        # Get fallback latencies from ModelCards
+        fallback_latencies = {
+            inst.instance_id: self.model_cards.get(inst.model_id, ModelCard(model_id=inst.model_id)).avg_latency_s
+            for inst in active_insts
+        }
+        
         results = await asyncio.gather(
-            *[self.controller.metrics(inst) for inst in active_insts],
+            *[
+                self.controller.metrics(inst, fallback_latencies.get(inst.instance_id, 60.0))
+                for inst in active_insts
+            ],
             return_exceptions=True
         )
         
@@ -207,9 +216,17 @@ class GPUScheduler:
         for inst, result in zip(active_insts, results):
             if isinstance(result, Exception):
                 logger.warning(f"Failed to get metrics for {inst.instance_id}: {result}")
-                metrics[inst.instance_id] = DrainLatency()
+                metrics[inst.instance_id] = DrainLatency(
+                    fallback_latency=fallback_latencies.get(inst.instance_id, 60.0)
+                )
             else:
                 metrics[inst.instance_id] = result
+                # Update ModelCard EMA with observed avg_latency
+                if result.latency_count > 0:
+                    card = self.model_cards.get(inst.model_id)
+                    if card:
+                        observed_avg = result.latency_sum / result.latency_count
+                        card.update_avg_latency(observed_avg, alpha=self.timing_ema_alpha)
         
         return metrics
     
