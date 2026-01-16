@@ -18,39 +18,39 @@ def submit_job():
         
         # Adjacency list: node -> [children]
         "graph": {
-            "layer1_qwen2.5_fast": ["layer2_aggregator"],
-            "layer1_qwen2.5_thoughtful": ["layer2_aggregator"],
-            "layer1_llama3.1_thoughtful": ["layer2_aggregator"],
-            "layer1_llama3.2_thoughtful": ["layer2_aggregator"],
-            "layer1_llama3.2_fast": ["layer2_aggregator"],
+            "layer1_1": ["layer2_aggregator"],
+            "layer1_2": ["layer2_aggregator"],
+            "layer1_3": ["layer2_aggregator"],
+            "layer1_4": ["layer2_aggregator"],
+            "layer1_5": ["layer2_aggregator"],
             "layer2_aggregator": []
         },
         
         # Map nodes to specific models
         "node_models": {
-            "layer1_qwen2.5_fast": "Qwen/Qwen2.5-3B",
-            "layer1_qwen2.5_thoughtful": "Qwen/Qwen2.5-7B",
-            "layer1_llama3.1_thoughtful": "meta-llama/Llama-3.1-8B-Instruct",
-            "layer1_llama3.2_thoughtful": "meta-llama/Llama-3.2-3B-Instruct",
-            "layer1_llama3.2_fast": "meta-llama/Llama-3.2-1B-Instruct",
-            "layer2_aggregator": "Qwen/Qwen3-4B-Instruct-2507"
+            "layer1_1": "Qwen/Qwen3-0.6B",
+            "layer1_2": "Qwen/Qwen3-4B",
+            "layer1_3": "Qwen/Qwen3-8B",
+            "layer1_4": "Qwen/Qwen3-4B-Instruct-2507",
+            "layer1_5": "Qwen/Qwen3-4B-Thinking-2507",
+            "layer2_aggregator": "meta-llama/llama-3.1-8B-Instruct"
         },
         
         # Initial inputs for source nodes
         "inputs": {
-            "layer1_qwen2.5_fast": {
+            "layer1_1": {
                 "messages": [{"role": "user", "content": "Explain quantum entanglement briefly."}],
             },
-            "layer1_qwen2.5_thoughtful": {
+            "layer1_2": {
                 "messages": [{"role": "user", "content": "Explain quantum entanglement in detail."}],
             },
-            "layer1_llama3.1_thoughtful": {
+            "layer1_3": {
                 "messages": [{"role": "user", "content": "Explain quantum entanglement in detail."}]
             },
-            "layer1_llama3.2_thoughtful": {
+            "layer1_4": {
                 "messages": [{"role": "user", "content": "Explain quantum entanglement in detail."}]
             },
-            "layer1_llama3.2_fast": {
+            "layer1_5": {
                 "messages": [{"role": "user", "content": "Explain quantum entanglement in detail."}]
             },
             # layer2_aggregator receives inputs automatically from parents

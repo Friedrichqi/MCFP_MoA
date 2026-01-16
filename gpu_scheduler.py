@@ -152,7 +152,7 @@ class GPUScheduler:
             solution = self._solver.solve()
             
             # 5. Generate plan from solution
-            plan = self._generate_plan(solution, needed_models)
+            plan = self._generate_plan(solution)
             
             # 6. Apply plan
             if not plan.is_empty:
@@ -232,7 +232,6 @@ class GPUScheduler:
     def _generate_plan(
         self,
         solution: MCFSolution,
-        needed_models: Set[str],
     ) -> ReconfigPlan:
         """Generate reconfiguration plan from MCF solution."""
         plan = ReconfigPlan(estimated_cost_s=solution.total_cost)
