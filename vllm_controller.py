@@ -585,6 +585,7 @@ class ManagedVLLMController:
                 payload = {"messages": [{"role": "user", "content": json.dumps(payload)}]}
         
         payload.setdefault("model", inst.model_id)
+        payload.setdefault("max_tokens", 2048)  # Default max tokens, can be overridden per-request
         url = inst.base_url.rstrip("/") + endpoint
         
         return await self._http_post_json(url, payload)
