@@ -41,13 +41,28 @@ from gpu_scheduler import GPUScheduler
 
 
 # -----------------------------
-# Logging
+# Logging with Blue Color
 # -----------------------------
+
+class BlueFormatter(logging.Formatter):
+    """Custom formatter that outputs log messages in blue."""
+    BLUE = "\033[34m"
+    RESET = "\033[0m"
+    
+    def format(self, record):
+        message = super().format(record)
+        return f"{self.BLUE}{message}{self.RESET}"
+
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+
+# Apply blue formatter to root handler
+for handler in logging.root.handlers:
+    handler.setFormatter(BlueFormatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+
 logger = logging.getLogger(__name__)
 
 
